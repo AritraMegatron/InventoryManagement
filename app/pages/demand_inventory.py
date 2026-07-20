@@ -1,4 +1,5 @@
 from __future__ import annotations
+from copy import deepcopy
 
 import asyncio
 import csv
@@ -878,6 +879,31 @@ def demand_inventory_page() -> None:
         refs['approve_button'].disable()
         refs['export_button'].disable()
 
+    def clear_demand_forecast_chart() -> None:
+        """Clear only the plotted demand series while keeping the card intact."""
+
+        cleared_options = deepcopy(
+            refs['forecast_chart'].options
+        )
+
+        for series in cleared_options.get(
+            'series',
+            [],
+        ):
+            series['data'] = []
+
+        _replace_echart_options(
+            refs['forecast_chart'],
+            cleared_options,
+        )
+
+        ui.notify(
+            'Demand forecast chart cleared',
+            type='info',
+            icon='delete_sweep',
+            position='top',
+        )
+
     def on_region_change(
         event: Any,
     ) -> None:
@@ -1471,7 +1497,7 @@ def demand_inventory_page() -> None:
             'max-[1050px]:grid-cols-1'
         ):
             with ui.card().classes(
-                'surface col-span-8 p-5 w-full '
+                'surface col-span-8 p-5 w-full relative '
                 'max-[1050px]:col-span-1'
             ):
                 with ui.row().classes(
@@ -1506,6 +1532,17 @@ def demand_inventory_page() -> None:
                     )
                 ).classes(
                     'w-full h-[340px] mt-2'
+                )
+
+                ui.button(
+                    'Clear chart',
+                    icon='delete_sweep',
+                    on_click=clear_demand_forecast_chart,
+                ).props(
+                    'outline no-caps dense color=secondary'
+                ).classes(
+                    'absolute bottom-4 right-5 z-10 '
+                    'rounded-lg px-3 bg-white'
                 )
 
             with ui.card().classes(
