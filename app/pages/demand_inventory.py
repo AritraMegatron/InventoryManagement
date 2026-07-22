@@ -2,8 +2,6 @@ from __future__ import annotations
 from copy import deepcopy
 
 import asyncio
-import csv
-import io
 from typing import Any
 
 from nicegui import ui
@@ -15,7 +13,8 @@ from app.mock_data import (
     OUTLETS,
     REGIONS,
     build_dashboard_snapshot,
-    build_replenishment_plan,
+    build_inventory_planning_data,
+    build_plan_summary,
     format_inr,
     outlets_for_region,
 )
@@ -28,6 +27,7 @@ from app.theme import (
 )
 
 
+
 INVENTORY_COLUMNS = [
     {
         'name': 'product',
@@ -38,7 +38,7 @@ INVENTORY_COLUMNS = [
     },
     {
         'name': 'forecast',
-        'label': 'Tomorrow forecast',
+        'label': 'Forecast demand',
         'field': 'forecast',
         'align': 'right',
         'sortable': True,
@@ -75,44 +75,44 @@ INVENTORY_COLUMNS = [
         'field': 'action',
         'align': 'left',
     },
+    {
+        'name': 'action_taken',
+        'label': 'Action taken',
+        'field': 'action_taken',
+        'align': 'left',
+    },
 ]
 
 
 PLAN_COLUMNS = [
     {
-        'name': 'product',
-        'label': 'Product',
-        'field': 'product',
+        'name': 'plan',
+        'label': 'Plan',
+        'field': 'plan',
         'align': 'left',
     },
     {
-        'name': 'method',
-        'label': 'Action',
-        'field': 'method',
+        'name': 'scope',
+        'label': 'Scope',
+        'field': 'scope',
         'align': 'left',
     },
     {
-        'name': 'from',
-        'label': 'Source / destination',
-        'field': 'from',
+        'name': 'source_summary',
+        'label': 'Source',
+        'field': 'source_summary',
         'align': 'left',
     },
     {
-        'name': 'quantity',
-        'label': 'Qty',
-        'field': 'quantity',
-        'align': 'right',
-    },
-    {
-        'name': 'eta',
-        'label': 'ETA',
-        'field': 'eta',
+        'name': 'expected_completion',
+        'label': 'Expected completion',
+        'field': 'expected_completion',
         'align': 'left',
     },
     {
-        'name': 'impact',
-        'label': 'Value protected',
-        'field': 'impact',
+        'name': 'cost',
+        'label': 'Cost',
+        'field': 'cost',
         'align': 'right',
     },
     {
@@ -243,10 +243,12 @@ def _forecast_chart_options(
     }
 
 
+
 def _risk_chart_options(
-    snapshot: dict[str, Any],
+    planning_data: dict[str, Any],
 ) -> dict[str, Any]:
-    rows = snapshot['inventory_rows']
+    rows = planning_data['inventory_rows']
+    horizon = planning_data['horizon']
 
     products = [
         row['product']
@@ -272,7 +274,7 @@ def _risk_chart_options(
         },
         'legend': {
             'data': [
-                'Tomorrow forecast',
+                f'Next {horizon} days demand',
                 'On hand',
             ],
             'bottom': 0,
@@ -317,7 +319,7 @@ def _risk_chart_options(
         },
         'series': [
             {
-                'name': 'Tomorrow forecast',
+                'name': f'Next {horizon} days demand',
                 'type': 'bar',
                 'data': forecast,
                 'barWidth': 9,
@@ -624,18 +626,28 @@ def demand_inventory_page() -> None:
     )
     _render_shell(ai_chat)
 
+
     state: dict[str, Any] = {
         'region': 'Delhi NCR',
         'outlet_id': 'dlf_noida',
         'horizon': 7,
+        'planning_horizon': 7,
         'run_number': 0,
+        'inventory_built': False,
         'plan_generated': False,
         'plan_approved': False,
+        'selected_inventory_row_id': None,
     }
 
     snapshot = build_dashboard_snapshot(
         outlet_id=state['outlet_id'],
         horizon=state['horizon'],
+        run_number=state['run_number'],
+    )
+
+    planning_data = build_inventory_planning_data(
+        outlet_id=state['outlet_id'],
+        horizon=state['planning_horizon'],
         run_number=state['run_number'],
     )
 
@@ -727,6 +739,148 @@ def demand_inventory_page() -> None:
                                 impact_classes
                             )
 
+
+    def render_inventory_risks(
+        risks: list[dict[str, Any]],
+    ) -> None:
+        risk_queue = refs.get('risk_queue')
+
+        if risk_queue is None:
+            return
+
+        risk_queue.clear()
+
+        with risk_queue:
+            if not risks:
+                ui.label(
+                    'No inventory exceptions for the selected planning horizon.'
+                ).classes(
+                    'text-sm muted'
+                )
+                return
+
+            for risk in risks[:4]:
+                if risk['severity'] == 'High':
+                    color = RED
+                elif risk['severity'] == 'Medium':
+                    color = GOLD
+                else:
+                    color = '#2E8B57'
+
+                with ui.card().classes(
+                    'w-full p-3 rounded-xl '
+                    'shadow-none border '
+                    'border-[#eee4e8]'
+                ):
+                    with ui.row().classes(
+                        'w-full justify-between '
+                        'items-start no-wrap'
+                    ):
+                        with ui.column().classes(
+                            'gap-0'
+                        ):
+                            ui.label(
+                                risk['product']
+                            ).classes(
+                                'text-sm font-bold'
+                            )
+
+                            ui.label(
+                                risk['detail']
+                            ).classes(
+                                'text-xs muted '
+                                'leading-relaxed'
+                            )
+
+                        ui.badge(
+                            risk['severity']
+                        ).style(
+                            f'background:{color};'
+                            f'color:white;'
+                        )
+
+    def clear_action_workflow() -> None:
+        state['inventory_built'] = False
+        state['plan_generated'] = False
+        state['plan_approved'] = False
+        state['selected_inventory_row_id'] = None
+
+        refs['inventory_table'].rows = []
+        refs['inventory_table'].update()
+
+        refs['inventory_status'].set_text(
+            'Build the action plan to load the latest inventory position.'
+        )
+
+        refs['plan_table'].rows = []
+        refs['plan_table'].update()
+
+        refs['plan_status'].set_text(
+            'No plan generated'
+        )
+
+        refs['generate_plan_button'].disable()
+        refs['approve_button'].disable()
+
+    def update_planning_view() -> None:
+        nonlocal planning_data
+
+        planning_data = build_inventory_planning_data(
+            outlet_id=state['outlet_id'],
+            horizon=state['planning_horizon'],
+            run_number=state['run_number'],
+        )
+
+        _replace_echart_options(
+            refs['risk_chart'],
+            _risk_chart_options(planning_data),
+        )
+
+        refs['planning_subtitle'].set_text(
+            f"Next {planning_data['horizon']} days demand "
+            f"compared with current usable stock"
+        )
+
+        refs['inventory_horizon_badge'].set_text(
+            f"NEXT {planning_data['horizon']} DAYS"
+        )
+
+        recommendation = planning_data['recommendation']
+
+        refs['rec_priority'].set_text(
+            f"{recommendation['priority'].upper()} PRIORITY"
+        )
+        refs['rec_headline'].set_text(
+            recommendation['headline']
+        )
+        refs['rec_body'].set_text(
+            recommendation['body']
+        )
+        refs['rec_impact'].set_text(
+            recommendation['impact']
+        )
+        refs['rec_waste'].set_text(
+            recommendation['waste']
+        )
+
+        refs['service_level'].set_text(
+            f"{planning_data['service_level']:.1f}%"
+        )
+        refs['risk_count'].set_text(
+            str(planning_data['at_risk_count'])
+        )
+        refs['avoidable_waste'].set_text(
+            format_inr(
+                planning_data['avoidable_waste']
+            )
+        )
+
+        render_inventory_risks(
+            planning_data['risks']
+        )
+
+        clear_action_workflow()
+
     async def run_forecast() -> None:
         refs['run_button'].disable()
 
@@ -741,8 +895,6 @@ def demand_inventory_page() -> None:
         await asyncio.sleep(0.85)
 
         state['run_number'] += 1
-        state['plan_generated'] = False
-        state['plan_approved'] = False
 
         new_snapshot = create_snapshot(
             outlet_id=state['outlet_id'],
@@ -802,82 +954,16 @@ def demand_inventory_page() -> None:
             'Forecast gross sales'
         )
 
-        refs['service_level'].set_text(
-            f"{kpis['service_level']:.1f}%"
-        )
-
-        refs['service_level_sub'].set_text(
-            'Projected product availability'
-        )
-
-        refs['risk_count'].set_text(
-            str(kpis['at_risk_count'])
-        )
-
-        refs['risk_count_sub'].set_text(
-            'SKUs need attention'
-        )
-
-        refs['avoidable_waste'].set_text(
-            format_inr(
-                kpis['avoidable_waste']
-            )
-        )
-
-        refs['avoidable_waste_sub'].set_text(
-            'Potential waste avoided'
-        )
-
         _replace_echart_options(
             refs['forecast_chart'],
             _forecast_chart_options(snapshot),
-        )
-
-        _replace_echart_options(
-            refs['risk_chart'],
-            _risk_chart_options(snapshot),
-        )
-
-        refs['inventory_table'].rows = (
-            snapshot['inventory_rows']
-        )
-        refs['inventory_table'].update()
-
-        recommendation = snapshot['recommendation']
-
-        refs['rec_priority'].set_text(
-            f"{recommendation['priority'].upper()} PRIORITY"
-        )
-
-        refs['rec_headline'].set_text(
-            recommendation['headline']
-        )
-
-        refs['rec_body'].set_text(
-            recommendation['body']
-        )
-
-        refs['rec_impact'].set_text(
-            recommendation['impact']
-        )
-
-        refs['rec_waste'].set_text(
-            recommendation['waste']
         )
 
         render_demand_signals(
             snapshot['signals']
         )
 
-        refs['plan_table'].rows = []
-        refs['plan_table'].update()
-
-        refs['plan_status'].set_text(
-            'No plan generated'
-        )
-
-        refs['approve_button'].disable()
-        refs['export_button'].disable()
+        update_planning_view()
 
     def clear_demand_forecast_chart() -> None:
         """Clear only the plotted demand series while keeping the card intact."""
@@ -942,8 +1028,6 @@ def demand_inventory_page() -> None:
     ) -> None:
         state['outlet_id'] = outlet_id
         state['run_number'] += 1
-        state['plan_generated'] = False
-        state['plan_approved'] = False
 
         new_snapshot = create_snapshot(
             outlet_id=outlet_id,
@@ -969,8 +1053,6 @@ def demand_inventory_page() -> None:
         )
 
         state['run_number'] += 1
-        state['plan_generated'] = False
-        state['plan_approved'] = False
 
         new_snapshot = create_snapshot(
             outlet_id=state['outlet_id'],
@@ -982,46 +1064,773 @@ def demand_inventory_page() -> None:
             new_snapshot
         )
 
-    async def generate_plan() -> None:
-        refs['plan_button'].disable()
+    def on_planning_horizon_change(
+        event: Any,
+    ) -> None:
+        state['planning_horizon'] = int(
+            event.value
+        )
+
+        update_planning_view()
+
+        ui.notify(
+            f"Inventory planning changed to the next "
+            f"{state['planning_horizon']} days. "
+            f"Build the action plan again.",
+            type='info',
+            position='top',
+        )
+
+    async def build_action_plan() -> None:
+        refs['build_action_button'].disable()
 
         progress = ui.notification(
-            'Checking available stock across nearby outlets…',
+            'Loading the latest inventory position…',
             spinner=True,
             type='ongoing',
             timeout=None,
             position='top',
         )
 
-        await asyncio.sleep(0.65)
+        await asyncio.sleep(0.45)
 
-        plan = build_replenishment_plan(
-            snapshot
+        rows = deepcopy(
+            planning_data['inventory_rows']
         )
 
-        state['plan_generated'] = True
+        refs['inventory_table'].rows = rows
+        refs['inventory_table'].update()
+
+        state['inventory_built'] = True
+        state['plan_generated'] = False
         state['plan_approved'] = False
 
-        refs['plan_table'].rows = plan
-        refs['plan_table'].update()
-
-        refs['plan_status'].set_text(
-            f"{len(plan)} actions ready · "
-            f"Awaiting regional manager approval"
+        refs['inventory_status'].set_text(
+            f"{len(rows)} products loaded for the next "
+            f"{state['planning_horizon']} days. "
+            f"Click a row to record an action."
         )
 
-        refs['approve_button'].enable()
-        refs['export_button'].enable()
-        refs['plan_button'].enable()
+        refs['plan_table'].rows = []
+        refs['plan_table'].update()
+        refs['plan_status'].set_text(
+            'No plan generated'
+        )
+        refs['generate_plan_button'].enable()
+        refs['approve_button'].disable()
+        refs['build_action_button'].enable()
 
         progress.dismiss()
 
         ui.notify(
-            'Replenishment plan generated',
+            'Latest outlet inventory position loaded',
+            type='positive',
+            icon='inventory_2',
+            position='top',
+        )
+
+    def _event_row_id(
+        event: Any,
+    ) -> int | str | None:
+        arguments = (
+            event.args
+            if isinstance(event.args, list)
+            else [event.args]
+        )
+
+        for argument in arguments:
+            if (
+                isinstance(argument, dict)
+                and argument.get('id') is not None
+            ):
+                return argument['id']
+
+        return None
+
+    def _selected_inventory_row() -> dict[str, Any] | None:
+        selected_id = state.get(
+            'selected_inventory_row_id'
+        )
+
+        return next(
+            (
+                row
+                for row in refs['inventory_table'].rows
+                if row['id'] == selected_id
+            ),
+            None,
+        )
+
+    def update_action_controls(
+        _: Any = None,
+    ) -> None:
+        row = _selected_inventory_row()
+
+        if row is None:
+            return
+
+        mode = refs['action_mode'].value
+        transfer_visible = mode == 'Transfer'
+
+        refs['transfer_action_fields'].set_visibility(
+            transfer_visible
+        )
+
+        if transfer_visible:
+            options = row.get(
+                'transfer_options',
+                {},
+            )
+
+            refs['action_source'].options = list(
+                options.keys()
+            )
+
+            if (
+                refs['action_source'].value
+                not in options
+            ):
+                refs['action_source'].value = next(
+                    iter(options),
+                    None,
+                )
+
+            refs['action_source'].update()
+            update_transfer_capacity()
+        else:
+            refs['action_quantity'].max = 5000
+            refs['safe_transfer_label'].set_text(
+                ''
+            )
+
+    def update_transfer_capacity(
+        _: Any = None,
+    ) -> None:
+        row = _selected_inventory_row()
+
+        if row is None:
+            return
+
+        source = refs['action_source'].value
+        safe_quantity = int(
+            row.get(
+                'transfer_options',
+                {},
+            ).get(
+                source,
+                0,
+            )
+        )
+
+        refs['safe_transfer_label'].set_text(
+            f'{safe_quantity} units can be safely transferred '
+            f'from {source}.'
+            if source
+            else 'Select a source outlet.'
+        )
+
+        refs['action_quantity'].max = safe_quantity
+
+        current_quantity = int(
+            refs['action_quantity'].value
+            or 0
+        )
+
+        if current_quantity > safe_quantity:
+            refs['action_quantity'].value = (
+                safe_quantity
+            )
+            refs['action_quantity'].update()
+
+    def open_inventory_action_dialog(
+        event: Any,
+    ) -> None:
+        row_id = _event_row_id(
+            event
+        )
+
+        if row_id is None:
+            return
+
+        state['selected_inventory_row_id'] = (
+            row_id
+        )
+
+        row = _selected_inventory_row()
+
+        if row is None:
+            return
+
+        refs['action_product'].set_text(
+            row['product']
+        )
+        refs['action_recommendation'].set_text(
+            row['action']
+        )
+
+        mode = (
+            row.get('action_type')
+            or row.get('recommended_mode')
+            or 'Order'
+        )
+
+        refs['action_mode'].value = mode
+        refs['action_quantity'].value = int(
+            row.get('action_quantity')
+            or row.get('recommended_qty')
+            or 0
+        )
+
+        source_options = row.get(
+            'transfer_options',
+            {},
+        )
+
+        refs['action_source'].options = list(
+            source_options.keys()
+        )
+        refs['action_source'].value = (
+            row.get('transfer_source')
+            or next(
+                iter(source_options),
+                None,
+            )
+        )
+
+        refs['action_mode'].update()
+        refs['action_quantity'].update()
+        refs['action_source'].update()
+
+        update_action_controls()
+        refs['action_dialog'].open()
+
+    def save_inventory_action() -> None:
+        row = _selected_inventory_row()
+
+        if row is None:
+            return
+
+        mode = refs['action_mode'].value
+        quantity = int(
+            refs['action_quantity'].value
+            or 0
+        )
+
+        if quantity <= 0:
+            row['action_type'] = ''
+            row['action_quantity'] = 0
+            row['transfer_source'] = ''
+            row['action_taken'] = 'No action'
+        elif mode == 'Order':
+            row['action_type'] = 'Order'
+            row['action_quantity'] = quantity
+            row['transfer_source'] = ''
+            row['action_taken'] = (
+                f'Procure {quantity} units'
+            )
+        else:
+            source = refs['action_source'].value
+            safe_quantity = int(
+                row.get(
+                    'transfer_options',
+                    {},
+                ).get(
+                    source,
+                    0,
+                )
+            )
+
+            if not source:
+                ui.notify(
+                    'Select a source outlet.',
+                    type='warning',
+                )
+                return
+
+            if quantity > safe_quantity:
+                ui.notify(
+                    f'Only {safe_quantity} units can be safely '
+                    f'transferred from {source}.',
+                    type='warning',
+                )
+                return
+
+            row['action_type'] = 'Transfer'
+            row['action_quantity'] = quantity
+            row['transfer_source'] = source
+            row['action_taken'] = (
+                f'Transfer {quantity} units from {source}'
+            )
+
+        refs['inventory_table'].update()
+        refs['action_dialog'].close()
+
+        state['plan_generated'] = False
+        state['plan_approved'] = False
+
+        refs['plan_table'].rows = []
+        refs['plan_table'].update()
+        refs['plan_status'].set_text(
+            'Actions changed · generate the plan again'
+        )
+        refs['approve_button'].disable()
+
+        ui.notify(
+            f"Action saved for {row['product']}",
+            type='positive',
+            position='top',
+        )
+
+    async def generate_replenishment_plan() -> None:
+        if not state['inventory_built']:
+            ui.notify(
+                'Build the action plan first.',
+                type='warning',
+            )
+            return
+
+        refs['generate_plan_button'].disable()
+
+        progress = ui.notification(
+            'Converting selected actions into purchase and transfer plans…',
+            spinner=True,
+            type='ongoing',
+            timeout=None,
+            position='top',
+        )
+
+        await asyncio.sleep(0.55)
+
+        plan_rows = build_plan_summary(
+            outlet_id=state['outlet_id'],
+            inventory_rows=refs['inventory_table'].rows,
+        )
+
+        refs['plan_table'].rows = plan_rows
+        refs['plan_table'].update()
+
+        ready_count = sum(
+            1
+            for row in plan_rows
+            if row['status'] == 'Ready for approval'
+        )
+
+        state['plan_generated'] = ready_count > 0
+        state['plan_approved'] = False
+
+        total_plan_cost = sum(
+            float(row.get('total_cost_value', 0))
+            for row in plan_rows
+            if row['status'] == 'Ready for approval'
+        )
+
+        plan_word = (
+            'plan'
+            if ready_count == 1
+            else 'plans'
+        )
+
+        refs['plan_status'].set_text(
+            (
+                f'{ready_count} coordinated {plan_word} · '
+                f'{format_inr(total_plan_cost)} total cost · '
+                f'click a row for details'
+                if ready_count
+                else 'No procurement or transfer actions were selected'
+            )
+        )
+
+        if ready_count:
+            refs['approve_button'].enable()
+        else:
+            refs['approve_button'].disable()
+
+        refs['generate_plan_button'].enable()
+        progress.dismiss()
+
+        ui.notify(
+            'Purchase and transfer plans generated',
             type='positive',
             icon='route',
             position='top',
         )
+
+
+    def open_plan_detail_dialog(
+        event: Any,
+    ) -> None:
+        row_id = _event_row_id(
+            event
+        )
+    
+        plan_row = next(
+            (
+                row
+                for row in refs['plan_table'].rows
+                if row['id'] == row_id
+            ),
+            None,
+        )
+    
+        if plan_row is None:
+            return
+    
+        document_type = (
+            'PURCHASE ORDER'
+            if plan_row['plan_type'] == 'purchase'
+            else 'STOCK TRANSFER NOTE'
+        )
+    
+        refs['plan_detail_title'].set_text(
+            document_type.title()
+        )
+        refs['plan_detail_summary'].set_text(
+            f"{plan_row['document_number']} · "
+            f"{plan_row['status']}"
+        )
+    
+        body = refs['plan_detail_body']
+        body.clear()
+    
+        with body:
+            details = plan_row.get(
+                'details',
+                [],
+            )
+    
+            if not details:
+                ui.label(
+                    'No actions were selected for this plan.'
+                ).classes(
+                    'text-sm muted py-4'
+                )
+            else:
+                with ui.card().classes(
+                    'w-full p-5 rounded-xl shadow-none '
+                    'border border-[#ded4d8] bg-[#fffdf9]'
+                ):
+                    with ui.row().classes(
+                        'w-full items-start justify-between gap-5'
+                    ):
+                        with ui.column().classes(
+                            'gap-1 max-w-[62%]'
+                        ):
+                            ui.label(
+                                plan_row['company_name']
+                            ).classes(
+                                'text-xl font-extrabold text-primary'
+                            )
+    
+                            ui.label(
+                                plan_row['company_address']
+                            ).classes(
+                                'text-xs muted leading-relaxed'
+                            )
+    
+                            ui.label(
+                                plan_row['company_phone']
+                            ).classes(
+                                'text-xs font-semibold'
+                            )
+    
+                        with ui.column().classes(
+                            'items-end gap-1'
+                        ):
+                            ui.label(
+                                document_type
+                            ).classes(
+                                'text-lg font-black tracking-[0.12em]'
+                            )
+    
+                            ui.label(
+                                plan_row['document_number']
+                            ).classes(
+                                'text-sm font-bold'
+                            )
+    
+                            ui.label(
+                                f"Issue date: {plan_row['document_date']}"
+                            ).classes(
+                                'text-xs muted'
+                            )
+    
+                            ui.badge(
+                                plan_row['status'],
+                                color=(
+                                    'positive'
+                                    if plan_row['status'] == 'Approved'
+                                    else 'secondary'
+                                ),
+                            ).props(
+                                'outline'
+                            )
+    
+                    ui.separator().classes(
+                        'my-4'
+                    )
+    
+                    with ui.grid(
+                        columns=2
+                    ).classes(
+                        'w-full gap-4 max-[700px]:grid-cols-1'
+                    ):
+                        with ui.card().classes(
+                            'p-4 rounded-xl shadow-none '
+                            'border border-[#eee4e8]'
+                        ):
+                            ui.label(
+                                'DELIVER TO'
+                            ).classes(
+                                'text-[10px] font-bold tracking-wider muted'
+                            )
+    
+                            ui.label(
+                                plan_row['outlet_name']
+                            ).classes(
+                                'text-sm font-bold mt-1'
+                            )
+    
+                            ui.label(
+                                plan_row['outlet_address']
+                            ).classes(
+                                'text-xs muted leading-relaxed'
+                            )
+    
+                            ui.label(
+                                plan_row['outlet_phone']
+                            ).classes(
+                                'text-xs font-semibold mt-1'
+                            )
+    
+                        with ui.card().classes(
+                            'p-4 rounded-xl shadow-none '
+                            'border border-[#eee4e8]'
+                        ):
+                            ui.label(
+                                'PROCUREMENT CONTACT'
+                            ).classes(
+                                'text-[10px] font-bold tracking-wider muted'
+                            )
+    
+                            ui.label(
+                                plan_row['manager_name']
+                            ).classes(
+                                'text-sm font-bold mt-1'
+                            )
+    
+                            ui.label(
+                                plan_row['manager_title']
+                            ).classes(
+                                'text-xs muted'
+                            )
+    
+                            ui.label(
+                                plan_row['manager_phone']
+                            ).classes(
+                                'text-xs font-semibold mt-1'
+                            )
+    
+                    ui.label(
+                        (
+                            'Vendor purchase lines'
+                            if plan_row['plan_type'] == 'purchase'
+                            else 'Authorized store-transfer lines'
+                        )
+                    ).classes(
+                        'text-sm font-bold mt-5'
+                    )
+    
+                    if plan_row['plan_type'] == 'purchase':
+                        columns = [
+                            {
+                                'name': 'vendor',
+                                'label': 'Vendor',
+                                'field': 'vendor',
+                                'align': 'left',
+                            },
+                            {
+                                'name': 'vendor_phone',
+                                'label': 'Vendor phone',
+                                'field': 'vendor_phone',
+                                'align': 'left',
+                            },
+                            {
+                                'name': 'item',
+                                'label': 'Ingredient',
+                                'field': 'item',
+                                'align': 'left',
+                            },
+                            {
+                                'name': 'quantity',
+                                'label': 'Qty',
+                                'field': 'quantity',
+                                'align': 'right',
+                            },
+                            {
+                                'name': 'unit',
+                                'label': 'Unit',
+                                'field': 'unit',
+                                'align': 'left',
+                            },
+                            {
+                                'name': 'cost',
+                                'label': 'Amount',
+                                'field': 'cost',
+                                'align': 'right',
+                            },
+                        ]
+                    else:
+                        columns = [
+                            {
+                                'name': 'product',
+                                'label': 'Product',
+                                'field': 'product',
+                                'align': 'left',
+                            },
+                            {
+                                'name': 'source',
+                                'label': 'Source outlet',
+                                'field': 'source',
+                                'align': 'left',
+                            },
+                            {
+                                'name': 'quantity',
+                                'label': 'Qty',
+                                'field': 'quantity',
+                                'align': 'right',
+                            },
+                            {
+                                'name': 'driver',
+                                'label': 'Driver',
+                                'field': 'driver',
+                                'align': 'left',
+                            },
+                            {
+                                'name': 'driver_phone',
+                                'label': 'Driver phone',
+                                'field': 'driver_phone',
+                                'align': 'left',
+                            },
+                            {
+                                'name': 'vehicle',
+                                'label': 'Vehicle',
+                                'field': 'vehicle',
+                                'align': 'left',
+                            },
+                            {
+                                'name': 'eta',
+                                'label': 'ETA',
+                                'field': 'eta',
+                                'align': 'left',
+                            },
+                            {
+                                'name': 'cost',
+                                'label': 'Amount',
+                                'field': 'cost',
+                                'align': 'right',
+                            },
+                        ]
+    
+                    ui.table(
+                        columns=columns,
+                        rows=details,
+                        row_key='id',
+                        pagination={
+                            'rowsPerPage': 20,
+                        },
+                    ).props(
+                        'flat bordered dense separator=horizontal '
+                        'hide-pagination'
+                    ).classes(
+                        'w-full mt-2'
+                    )
+    
+                    with ui.row().classes(
+                        'w-full justify-end mt-4'
+                    ):
+                        with ui.card().classes(
+                            'min-w-[260px] p-4 rounded-xl shadow-none '
+                            'border border-[#ded4d8] bg-[#f8f2f4]'
+                        ):
+                            with ui.row().classes(
+                                'w-full justify-between gap-8'
+                            ):
+                                ui.label(
+                                    'TOTAL'
+                                ).classes(
+                                    'text-sm font-bold'
+                                )
+    
+                                ui.label(
+                                    plan_row['cost']
+                                ).classes(
+                                    'text-xl font-extrabold text-primary'
+                                )
+    
+                    ui.label(
+                        (
+                            'Terms: Delivery quantities are subject to '
+                            'receiving inspection and vendor invoice matching.'
+                            if plan_row['plan_type'] == 'purchase'
+                            else
+                            'Terms: Driver must obtain source and destination '
+                            'store acknowledgements before closing the trip.'
+                        )
+                    ).classes(
+                        'text-[11px] muted mt-4'
+                    )
+    
+                    ui.separator().classes(
+                        'my-5'
+                    )
+    
+                    ui.label(
+                        'PROCUREMENT MANAGER AUTHORIZATION'
+                    ).classes(
+                        'text-[10px] font-bold tracking-wider muted'
+                    )
+    
+                    with ui.grid(
+                        columns=2
+                    ).classes(
+                        'w-full gap-8 mt-5 max-[700px]:grid-cols-1'
+                    ):
+                        with ui.column().classes(
+                            'gap-1'
+                        ):
+                            ui.label(
+                                plan_row['manager_name']
+                            ).classes(
+                                'text-sm font-bold'
+                            )
+    
+                            ui.label(
+                                plan_row['manager_title']
+                            ).classes(
+                                'text-xs muted'
+                            )
+    
+                            ui.label(
+                                plan_row['manager_phone']
+                            ).classes(
+                                'text-xs'
+                            )
+    
+                        with ui.column().classes(
+                            'gap-2'
+                        ):
+                            ui.element('div').style(
+                                'height:34px;'
+                                'border-bottom:1px solid #6b5960;'
+                            )
+    
+                            ui.label(
+                                'Authorized signature and date'
+                            ).classes(
+                                'text-[10px] muted'
+                            )
+    
+        refs['plan_detail_dialog'].open()
 
     def open_approval_dialog() -> None:
         if not state['plan_generated']:
@@ -1031,13 +1840,18 @@ def demand_inventory_page() -> None:
             )
             return
 
+        ready_rows = [
+            row
+            for row in refs['plan_table'].rows
+            if row['status'] == 'Ready for approval'
+        ]
+
         refs['approval_outlet'].set_text(
             snapshot['outlet'].name
         )
 
         refs['approval_actions'].set_text(
-            f"{len(refs['plan_table'].rows)} "
-            f"inventory actions will be released."
+            f"{len(ready_rows)} plan groups will be released."
         )
 
         refs['approve_dialog'].open()
@@ -1046,12 +1860,13 @@ def demand_inventory_page() -> None:
         state['plan_approved'] = True
 
         for row in refs['plan_table'].rows:
-            row['status'] = 'Approved'
+            if row['status'] == 'Ready for approval':
+                row['status'] = 'Approved'
 
         refs['plan_table'].update()
 
         refs['plan_status'].set_text(
-            'Approved · Dispatch and procurement tasks created'
+            'Approved · Purchase orders and dispatch tasks created'
         )
 
         refs['approve_dialog'].close()
@@ -1068,10 +1883,10 @@ def demand_inventory_page() -> None:
         high_risk = next(
             (
                 risk
-                for risk in snapshot['risks']
+                for risk in planning_data['risks']
                 if risk['severity'] == 'High'
             ),
-            snapshot['primary_risk'],
+            planning_data['primary_risk'],
         )
 
         refs['transfer_product'].set_text(
@@ -1093,67 +1908,147 @@ def demand_inventory_page() -> None:
             or 0
         )
 
-        source = (
-            refs['transfer_source'].value
-        )
+        source = refs['transfer_source'].value
 
         refs['transfer_dialog'].close()
 
         ui.notify(
             f'{quantity} units reserved from '
-            f'{source}; simulated ETA 62 minutes.',
+            f'{source}; simulated ETA within 24 hours.',
             type='positive',
             icon='local_shipping',
             position='top',
         )
 
-    def export_plan() -> None:
-        rows = refs['plan_table'].rows
 
-        if not rows:
-            ui.notify(
-                'Generate a plan first.',
-                type='warning',
+    with ui.dialog() as action_dialog:
+        with ui.card().classes(
+            'w-[560px] max-w-[94vw] '
+            'p-6 rounded-2xl'
+        ):
+            refs['action_dialog'] = action_dialog
+
+            ui.label(
+                'Record inventory action'
+            ).classes(
+                'text-lg font-bold'
             )
-            return
 
-        buffer = io.StringIO()
+            refs['action_product'] = ui.label(
+                ''
+            ).classes(
+                'text-base font-bold mt-1'
+            )
 
-        fieldnames = [
-            'product',
-            'method',
-            'from',
-            'quantity',
-            'eta',
-            'impact',
-            'status',
-        ]
+            refs['action_recommendation'] = ui.label(
+                ''
+            ).classes(
+                'text-xs muted'
+            )
 
-        writer = csv.DictWriter(
-            buffer,
-            fieldnames=fieldnames,
-        )
+            ui.separator().classes(
+                'my-4'
+            )
 
-        writer.writeheader()
+            refs['action_mode'] = ui.radio(
+                ['Order', 'Transfer'],
+                value='Order',
+                on_change=update_action_controls,
+            ).props(
+                'inline'
+            )
 
-        writer.writerows(
-            {
-                key: row[key]
-                for key in fieldnames
-            }
-            for row in rows
-        )
+            refs['action_quantity'] = ui.number(
+                label='Units',
+                value=0,
+                min=0,
+                max=5000,
+                step=1,
+            ).props(
+                'outlined dense'
+            ).classes(
+                'w-full mt-2'
+            )
 
-        ui.download(
-            buffer.getvalue().encode(
-                'utf-8'
-            ),
-            filename=(
-                f"replenishment_plan_"
-                f"{state['outlet_id']}.csv"
-            ),
-            media_type='text/csv',
-        )
+            refs['transfer_action_fields'] = ui.column().classes(
+                'w-full gap-2'
+            )
+
+            with refs['transfer_action_fields']:
+                refs['action_source'] = ui.select(
+                    [],
+                    label='Source outlet',
+                    on_change=update_transfer_capacity,
+                ).props(
+                    'outlined dense'
+                ).classes(
+                    'w-full'
+                )
+
+                refs['safe_transfer_label'] = ui.label(
+                    ''
+                ).classes(
+                    'text-xs muted'
+                )
+
+            with ui.row().classes(
+                'w-full justify-end gap-2 mt-4'
+            ):
+                ui.button(
+                    'Cancel',
+                    on_click=action_dialog.close,
+                ).props(
+                    'flat no-caps'
+                )
+
+                ui.button(
+                    'Save action',
+                    icon='check',
+                    on_click=save_inventory_action,
+                ).props(
+                    'unelevated no-caps'
+                ).classes(
+                    'rounded-xl'
+                )
+
+    with ui.dialog() as plan_detail_dialog:
+        with ui.card().classes(
+            'w-[1120px] max-w-[97vw] '
+            'p-6 rounded-2xl'
+        ):
+            refs['plan_detail_dialog'] = (
+                plan_detail_dialog
+            )
+
+            refs['plan_detail_title'] = ui.label(
+                ''
+            ).classes(
+                'text-lg font-bold'
+            )
+
+            refs['plan_detail_summary'] = ui.label(
+                ''
+            ).classes(
+                'text-sm muted'
+            )
+
+            ui.separator().classes(
+                'my-3'
+            )
+
+            refs['plan_detail_body'] = ui.column().classes(
+                'w-full gap-3'
+            )
+
+            with ui.row().classes(
+                'w-full justify-end mt-4'
+            ):
+                ui.button(
+                    'Close',
+                    on_click=plan_detail_dialog.close,
+                ).props(
+                    'flat no-caps'
+                )
 
     with ui.dialog() as approve_dialog:
         with ui.card().classes(
@@ -1202,8 +2097,8 @@ def demand_inventory_page() -> None:
             )
 
             ui.label(
-                'This concept keeps the final operational '
-                'decision with the regional manager.'
+                'Approval releases the simulated purchase orders '
+                'and store-transfer dispatch tasks.'
             ).classes(
                 'text-xs muted'
             )
@@ -1461,7 +2356,7 @@ def demand_inventory_page() -> None:
                 refs['service_level_sub'],
             ) = _metric_card(
                 'Projected service level',
-                f"{snapshot['kpis']['service_level']:.1f}%",
+                f"{planning_data['service_level']:.1f}%",
                 'Product availability',
                 'verified',
             )
@@ -1472,7 +2367,7 @@ def demand_inventory_page() -> None:
             ) = _metric_card(
                 'Inventory risks',
                 str(
-                    snapshot['kpis']['at_risk_count']
+                    planning_data['at_risk_count']
                 ),
                 'SKUs need attention',
                 'warning_amber',
@@ -1484,7 +2379,7 @@ def demand_inventory_page() -> None:
             ) = _metric_card(
                 'Avoidable waste',
                 format_inr(
-                    snapshot['kpis']['avoidable_waste']
+                    planning_data['avoidable_waste']
                 ),
                 'Potential waste avoided',
                 'compost',
@@ -1560,7 +2455,7 @@ def demand_inventory_page() -> None:
                     )
 
                     refs['rec_priority'] = ui.label(
-                        f"{snapshot['recommendation']['priority'].upper()} "
+                        f"{planning_data['recommendation']['priority'].upper()} "
                         f"PRIORITY"
                     ).classes(
                         'text-[10px] font-bold '
@@ -1568,14 +2463,14 @@ def demand_inventory_page() -> None:
                     )
 
                 refs['rec_headline'] = ui.label(
-                    snapshot['recommendation']['headline']
+                    planning_data['recommendation']['headline']
                 ).classes(
                     'text-xl font-extrabold '
                     'leading-tight mt-4'
                 )
 
                 refs['rec_body'] = ui.label(
-                    snapshot['recommendation']['body']
+                    planning_data['recommendation']['body']
                 ).classes(
                     'text-sm leading-relaxed '
                     'text-white/75 mt-1'
@@ -1601,7 +2496,7 @@ def demand_inventory_page() -> None:
                         )
 
                         refs['rec_impact'] = ui.label(
-                            snapshot['recommendation']['impact']
+                            planning_data['recommendation']['impact']
                         ).classes(
                             'text-xl font-bold text-amber-200'
                         )
@@ -1617,15 +2512,15 @@ def demand_inventory_page() -> None:
                         )
 
                         refs['rec_waste'] = ui.label(
-                            snapshot['recommendation']['waste']
+                            planning_data['recommendation']['waste']
                         ).classes(
                             'text-xl font-bold'
                         )
 
-                ui.button(
+                refs['build_action_button'] = ui.button(
                     'Build action plan',
                     icon='route',
-                    on_click=generate_plan,
+                    on_click=build_action_plan,
                 ).props(
                     'unelevated no-caps '
                     'color=secondary text-color=dark'
@@ -1673,6 +2568,7 @@ def demand_inventory_page() -> None:
                 snapshot['signals']
             )
 
+
         with ui.grid(
             columns=12
         ).classes(
@@ -1684,7 +2580,7 @@ def demand_inventory_page() -> None:
                 'max-[1050px]:col-span-1'
             ):
                 with ui.row().classes(
-                    'w-full items-start justify-between'
+                    'w-full items-start justify-between gap-3'
                 ):
                     with ui.column().classes(
                         'gap-0'
@@ -1695,23 +2591,40 @@ def demand_inventory_page() -> None:
                             'text-lg font-bold'
                         )
 
-                        ui.label(
-                            'Tomorrow forecast compared '
-                            'with current usable stock'
+                        refs['planning_subtitle'] = ui.label(
+                            f"Next {planning_data['horizon']} days demand "
+                            f"compared with current usable stock"
                         ).classes(
                             'text-xs muted'
                         )
 
-                    ui.badge(
-                        'OUTLET LEVEL',
-                        color='primary',
-                    ).props(
-                        'outline'
-                    )
+                    with ui.row().classes(
+                        'items-center gap-2'
+                    ):
+                        refs['planning_horizon_select'] = ui.select(
+                            {
+                                7: 'Next 7 days',
+                                14: 'Next 14 days',
+                            },
+                            value=state['planning_horizon'],
+                            label='Inventory horizon',
+                            on_change=on_planning_horizon_change,
+                        ).props(
+                            'outlined dense options-dense'
+                        ).classes(
+                            'w-40'
+                        )
+
+                        ui.badge(
+                            'OUTLET LEVEL',
+                            color='primary',
+                        ).props(
+                            'outline'
+                        )
 
                 refs['risk_chart'] = ui.echart(
                     _risk_chart_options(
-                        snapshot
+                        planning_data
                     )
                 ).classes(
                     'w-full h-[360px] mt-2'
@@ -1745,47 +2658,14 @@ def demand_inventory_page() -> None:
                         'text-2xl text-negative'
                     )
 
-                with ui.column().classes(
+                refs['risk_queue'] = ui.column().classes(
                     'w-full gap-3 mt-4'
-                ):
-                    for risk in snapshot['risks'][:4]:
-                        color = (
-                            RED
-                            if risk['severity'] == 'High'
-                            else GOLD
-                        )
+                )
 
-                        with ui.card().classes(
-                            'w-full p-3 rounded-xl '
-                            'shadow-none border '
-                            'border-[#eee4e8]'
-                        ):
-                            with ui.row().classes(
-                                'w-full justify-between '
-                                'items-start no-wrap'
-                            ):
-                                with ui.column().classes(
-                                    'gap-0'
-                                ):
-                                    ui.label(
-                                        risk['product']
-                                    ).classes(
-                                        'text-sm font-bold'
-                                    )
+                render_inventory_risks(
+                    planning_data['risks']
+                )
 
-                                    ui.label(
-                                        risk['detail']
-                                    ).classes(
-                                        'text-xs muted '
-                                        'leading-relaxed'
-                                    )
-
-                                ui.badge(
-                                    risk['severity']
-                                ).style(
-                                    f'background:{color};'
-                                    f'color:white;'
-                                )
 
         with ui.card().classes(
             'surface w-full p-5 table-shell'
@@ -1802,15 +2682,14 @@ def demand_inventory_page() -> None:
                         'text-lg font-bold'
                     )
 
-                    ui.label(
-                        'Demand-adjusted coverage by product '
-                        '· simulated quantities'
+                    refs['inventory_status'] = ui.label(
+                        'Build the action plan to load the latest inventory position.'
                     ).classes(
                         'text-xs muted'
                     )
 
                 with ui.row().classes(
-                    'gap-2'
+                    'gap-2 items-center'
                 ):
                     ui.badge(
                         '7 PRODUCTS',
@@ -1819,16 +2698,28 @@ def demand_inventory_page() -> None:
                         'outline'
                     )
 
-                    ui.badge(
-                        'Tomorrow 18:00 peak',
+                    refs['inventory_horizon_badge'] = ui.badge(
+                        f"NEXT {planning_data['horizon']} DAYS",
                         color='secondary',
                     ).props(
                         'outline'
                     )
 
+                    refs['generate_plan_button'] = ui.button(
+                        'Generate Plan',
+                        icon='route',
+                        on_click=generate_replenishment_plan,
+                    ).props(
+                        'outline no-caps'
+                    ).classes(
+                        'rounded-xl'
+                    )
+
+                    refs['generate_plan_button'].disable()
+
             refs['inventory_table'] = ui.table(
                 columns=INVENTORY_COLUMNS,
-                rows=snapshot['inventory_rows'],
+                rows=[],
                 row_key='id',
                 pagination={
                     'rowsPerPage': 7,
@@ -1837,8 +2728,19 @@ def demand_inventory_page() -> None:
                 'flat bordered dense '
                 'separator=horizontal'
             ).classes(
-                'w-full mt-3'
+                'w-full mt-3 cursor-pointer'
             )
+
+            refs['inventory_table'].on(
+                'rowClick',
+                open_inventory_action_dialog,
+                [
+                    [],
+                    ['id'],
+                    None,
+                ],
+            )
+
 
         with ui.card().classes(
             'surface w-full p-5 table-shell'
@@ -1861,55 +2763,40 @@ def demand_inventory_page() -> None:
                         'text-xs muted'
                     )
 
-                with ui.row().classes(
-                    'gap-2'
-                ):
-                    refs['export_button'] = ui.button(
-                        'Export CSV',
-                        icon='download',
-                        on_click=export_plan,
-                    ).props(
-                        'outline no-caps'
-                    ).classes(
-                        'rounded-xl'
-                    )
+                refs['approve_button'] = ui.button(
+                    'Approve plan',
+                    icon='check_circle',
+                    on_click=open_approval_dialog,
+                ).props(
+                    'unelevated no-caps'
+                ).classes(
+                    'rounded-xl'
+                )
 
-                    refs['export_button'].disable()
-
-                    refs['plan_button'] = ui.button(
-                        'Generate plan',
-                        icon='route',
-                        on_click=generate_plan,
-                    ).props(
-                        'outline no-caps'
-                    ).classes(
-                        'rounded-xl'
-                    )
-
-                    refs['approve_button'] = ui.button(
-                        'Approve plan',
-                        icon='check_circle',
-                        on_click=open_approval_dialog,
-                    ).props(
-                        'unelevated no-caps'
-                    ).classes(
-                        'rounded-xl'
-                    )
-
-                    refs['approve_button'].disable()
+                refs['approve_button'].disable()
 
             refs['plan_table'] = ui.table(
                 columns=PLAN_COLUMNS,
                 rows=[],
                 row_key='id',
                 pagination={
-                    'rowsPerPage': 5,
+                    'rowsPerPage': 2,
                 },
             ).props(
                 'flat bordered dense '
                 'separator=horizontal'
             ).classes(
-                'w-full mt-3'
+                'w-full mt-3 cursor-pointer'
+            )
+
+            refs['plan_table'].on(
+                'rowClick',
+                open_plan_detail_dialog,
+                [
+                    [],
+                    ['id'],
+                    None,
+                ],
             )
 
         with ui.row().classes(
