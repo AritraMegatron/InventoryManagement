@@ -1,0 +1,42 @@
+VESPER DEMO ENTRY VALUES
+
+Location name:
+DLF Mall of India - Hypothetical Beverage & Dessert Unit
+
+Address:
+Plot No. M-03, Sector 18, Noida, Uttar Pradesh 201301, India
+
+Monthly rent:
+485000
+
+Square footage:
+780
+
+Optional city:
+Noida
+
+Optional state:
+Uttar Pradesh
+
+Optional PIN code:
+201301
+
+Location notes - paste the text below into Vesper:
+
+The proposed site is a hypothetical 780 sq. ft. beverage and dessert unit inside DLF Mall of India. Broker materials indicate strong weekend and evening family traffic, but no audited footfall data has been supplied. The immediate catchment includes shoppers, office workers, young adults and delivery demand from Sector 18. Competition from coffee, ice-cream, bakery and QSR brands is high, so the format should emphasize fast service, visually distinctive products and a focused menu.
+
+Commercial information is inconsistent across the uploaded documents. The broker brief quotes INR 4.85 lakh monthly rent, 6 months' deposit, no revenue share, 45 fit-out days and a 15 September 2026 handover. The draft terms quote INR 5.10 lakh monthly rent, 8 months' deposit, 7% revenue share or minimum rent, 30 fit-out days and a 1 October 2026 handover. Technical approval for exhaust, drainage and final electrical load is still pending. Delivery access is restricted to a morning service window. Treat this candidate as attractive but dependent on commercial reconciliation and technical due diligence.
+
+FILES TO UPLOAD:
+1. 01_Broker_Property_Brief_DLF_Mall_of_India.pdf
+2. 02_Draft_Commercial_Terms_DLF_Mall_of_India.docx
+3. 03_Site_Visit_Notes_DLF_Mall_of_India.txt
+
+EXPECTED VESPER RAG ENGINE THEMES:
+- Strong mall demand and weekend/evening opportunity
+- High occupancy cost and significant competition
+- Contradictory rent, deposit, revenue-share, handover and fit-out terms
+- Unverified broker footfall estimate
+- Pending exhaust, drainage, fire and electrical approvals
+- Restricted delivery access
+- Need for a beverage-led, low-heat operating format

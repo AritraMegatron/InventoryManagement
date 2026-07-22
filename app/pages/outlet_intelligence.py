@@ -1,166 +1,78 @@
 from __future__ import annotations
 
 import asyncio
+import json
+import uuid
+from copy import deepcopy
 from typing import Any
 
-from nicegui import ui
+from nicegui import app, ui
 
 from app.ai_chat import AIChatController, create_ai_chat
 from app.company_context import PAGE_CONTEXTS
+from app.data.outlet_candidates import (
+    OUTLET_STATE_SCHEMA_VERSION,
+    SOURCE_CATALOG,
+    clone_default_candidates,
+    create_empty_candidate,
+)
+from app.services.location_service import (
+    LocationSuggestion,
+    create_location_service,
+)
+from app.services.outlet_analysis import calculate_location_analysis
+from app.services.outlet_document_analysis import (
+    MAX_DOCUMENTS,
+    MAX_FILE_BYTES,
+    MAX_TOTAL_BYTES,
+    SUPPORTED_EXTENSIONS,
+    OutletDocumentAnalysisService,
+    OutletDocumentAnalysisError,
+    validate_document,
+)
+from app.theme import BURGUNDY, GOLD, GREEN, RED, apply_theme
 
-from app.theme import BURGUNDY, GOLD, GREEN, MUTED, RED, apply_theme
 
-
-SOURCE_CATALOG = {
-    'team': ('Expansion team site notes', 'Internal unstructured document', 'Uploaded by team'),
-    'broker': ('Broker quotation / lease proposal', 'Internal uploaded document', 'Uploaded by team'),
-    'places': ('Nearby business listings', 'External competition intelligence', 'Mock refresh: today'),
-    'osm': ('OpenStreetMap points of interest', 'External location data', 'Mock refresh: today'),
-    'mobility': ('Transit and mobility dataset', 'External mobility data', 'Mock refresh: today'),
-    'delivery': ('Delivery-demand heatmap', 'External channel signal', 'Mock refresh: today'),
-    'rent': ('Commercial rent benchmark', 'External property estimate', 'Mock refresh: today'),
-    'network': ('Existing outlet master', 'Internal structured database', 'Current mock snapshot'),
+OUTLET_STORAGE_KEY = 'vesper_outlet_intelligence_v2'
+# A new value is created every time this Python module starts. Including it in
+# tab state guarantees that even Redis-backed tab storage returns to the four
+# original candidates after a demo/server restart.
+OUTLET_PROCESS_BOOT_ID = uuid.uuid4().hex
+STATUS_COLORS = {
+    'Recommended': GREEN,
+    'Review': GOLD,
+    'High risk': RED,
 }
-
-
-CANDIDATES: dict[str, dict[str, Any]] = {
-    'noida': {
-        'name': 'Sector 62, Noida',
-        'city': 'Noida, Uttar Pradesh',
-        'lat': 28.6280,
-        'lng': 77.3649,
-        'status': 'Recommended',
-        'address': 'Electronic City Metro corridor, Sector 62, Noida, Uttar Pradesh',
-        'rent': 3.25,
-        'sqft': 680,
-        'optional': {'Frontage': '24 ft.', 'Floor': 'Ground floor', 'Parking': 'Paid parking within 250 m'},
-        'notes': (
-            'Strong office crowd on weekdays and visible from the metro exit. '
-            'The site feels larger than required for a takeaway-led outlet.'
-        ),
-        'documents': ['Broker quotation.pdf', 'Site visit notes.docx', '12 storefront photographs'],
-        'score': 84,
-        'sales': 19.4,
-        'margin': 21.0,
-        'break_even': 17,
-        'cannibalization': 'Low',
-        'verdict': 'Proceed with conditions',
-        'summary': 'Demand is attractive, but the footprint is oversized. Negotiate rent and reduce the format.',
-        'format': 'Compact takeaway outlet · 350–425 sq. ft.',
-        'signals': [
-            ('Weekday office demand', 'High concentration', 'positive', '+11 points', 'osm', 'Dense office and coworking locations within the trade area.'),
-            ('Metro access', '430 m walking distance', 'positive', '+8 points', 'mobility', 'A major metro access point is approximately 430 m away.'),
-            ('Delivery demand', '82 / 100', 'positive', '+7 points', 'delivery', 'Strong evening delivery demand is expected in the local catchment.'),
-            ('Direct competition', '2 outlets within 800 m', 'risk', '-6 points', 'places', 'Two relevant beverage or dessert operators were identified nearby.'),
-            ('Rent benchmark', '12% above local median', 'risk', '-5 points', 'rent', 'The submitted rent is above the modeled local benchmark.'),
-            ('Network overlap', 'Nearest outlet 6.8 km', 'positive', '+5 points', 'network', 'The location has limited overlap with the current outlet network.'),
-        ],
-    },
-    'gurugram': {
-        'name': 'Golf Course Road, Gurugram',
-        'city': 'Gurugram, Haryana',
-        'lat': 28.4446,
-        'lng': 77.0996,
-        'status': 'Review',
-        'address': 'Golf Course Road commercial belt, Sector 54, Gurugram, Haryana',
-        'rent': 5.60,
-        'sqft': 920,
-        'optional': {'Frontage': '31 ft.', 'Floor': 'Ground floor', 'Parking': 'Valet available'},
-        'notes': (
-            'Premium catchment and excellent visibility. The broker is positioning it as a flagship, '
-            'but rent and security deposit are aggressive.'
-        ),
-        'documents': ['Commercial lease proposal.pdf', 'Broker WhatsApp summary.txt'],
-        'score': 72,
-        'sales': 26.8,
-        'margin': 16.5,
-        'break_even': 29,
-        'cannibalization': 'Medium',
-        'verdict': 'Review economics',
-        'summary': 'Premium revenue potential is strong, but occupancy cost materially weakens returns.',
-        'format': 'Premium compact café · 500–600 sq. ft.',
-        'signals': [
-            ('Premium customer fit', 'Very high', 'positive', '+13 points', 'osm', 'Premium residential, office and retail density is high.'),
-            ('Delivery demand', '88 / 100', 'positive', '+9 points', 'delivery', 'The area supports strong evening delivery volume and order value.'),
-            ('Brand visibility', 'Excellent', 'positive', '+7 points', 'team', 'The team reported high frontage visibility from the main corridor.'),
-            ('Rent benchmark', '19% above local median', 'risk', '-14 points', 'rent', 'The quoted lease rate is materially above the modeled benchmark.'),
-            ('Competition', '5 dessert brands within 1.2 km', 'risk', '-8 points', 'places', 'The immediate trade area is highly competitive.'),
-            ('Network overlap', 'Nearest outlet 3.1 km', 'risk', '-7 points', 'network', 'Delivery-radius overlap with an existing outlet is meaningful.'),
-        ],
-    },
-    'kolkata': {
-        'name': 'Sector V, Salt Lake',
-        'city': 'Kolkata, West Bengal',
-        'lat': 22.5726,
-        'lng': 88.4331,
-        'status': 'Recommended',
-        'address': 'College More commercial cluster, Sector V, Salt Lake, Kolkata',
-        'rent': 2.45,
-        'sqft': 520,
-        'optional': {'Frontage': '18 ft.', 'Floor': 'Ground floor', 'Parking': 'Shared commercial parking'},
-        'notes': (
-            'Strong office cluster. Weekends are visibly quiet. The site may work best as a '
-            'weekday-led compact store with corporate-order capability.'
-        ),
-        'documents': ['Kolkata market visit notes.docx', 'Broker rent sheet.xlsx'],
-        'score': 81,
-        'sales': 16.8,
-        'margin': 22.4,
-        'break_even': 16,
-        'cannibalization': 'Low',
-        'verdict': 'Proceed with weekday-led format',
-        'summary': 'Strong weekday economics and favorable rent support a compact outlet.',
-        'format': 'Office-cluster takeaway outlet · 400–500 sq. ft.',
-        'signals': [
-            ('Office density', 'Very high', 'positive', '+12 points', 'osm', 'A large office and technology-company concentration exists within 2 km.'),
-            ('Rent benchmark', '8% below local median', 'positive', '+9 points', 'rent', 'The proposed rent is favorable relative to local commercial benchmarks.'),
-            ('Cannibalization', 'Nearest outlet 9.4 km', 'positive', '+6 points', 'network', 'The candidate has limited overlap with the existing network.'),
-            ('Weekend activity', 'Low', 'risk', '-6 points', 'team', 'The team observed low Saturday afternoon pedestrian activity.'),
-            ('Competition', '3 beverage outlets within 1 km', 'risk', '-4 points', 'places', 'Three relevant operators compete in the local trade area.'),
-            ('Delivery demand', '75 / 100', 'positive', '+5 points', 'delivery', 'Delivery demand is healthy but concentrated on weekdays.'),
-        ],
-    },
-    'bengaluru': {
-        'name': 'Indiranagar 100 Feet Road',
-        'city': 'Bengaluru, Karnataka',
-        'lat': 12.9719,
-        'lng': 77.6412,
-        'status': 'High risk',
-        'address': '100 Feet Road retail corridor, Indiranagar, Bengaluru, Karnataka',
-        'rent': 6.80,
-        'sqft': 740,
-        'optional': {'Frontage': '22 ft.', 'Floor': 'Ground floor', 'Parking': 'Very limited'},
-        'notes': (
-            'Excellent brand visibility and youth traffic, but the street is saturated with cafés, '
-            'dessert stores and beverage brands. Rent is aggressive.'
-        ),
-        'documents': ['Bengaluru broker proposal.pdf', 'Competitor walk-through notes.txt'],
-        'score': 61,
-        'sales': 24.1,
-        'margin': 11.8,
-        'break_even': 38,
-        'cannibalization': 'Medium',
-        'verdict': 'Do not proceed at current terms',
-        'summary': 'High demand is outweighed by rent, competition and capital requirements.',
-        'format': 'Small-format test store only · 300–400 sq. ft.',
-        'signals': [
-            ('Target customer density', 'Exceptional', 'positive', '+15 points', 'osm', 'Youth, dining and nightlife activity is extremely strong.'),
-            ('Brand visibility', 'Excellent', 'positive', '+8 points', 'team', 'The team identified strong frontage and high evening pedestrian activity.'),
-            ('Competition', '9 brands within 1 km', 'risk', '-15 points', 'places', 'Nine relevant dessert or beverage concepts operate nearby.'),
-            ('Rent benchmark', '26% above local median', 'risk', '-17 points', 'rent', 'The proposed lease rate is significantly above the modeled benchmark.'),
-            ('Parking', 'Poor', 'risk', '-5 points', 'mobility', 'Limited parking reduces convenience for longer café visits.'),
-            ('Network overlap', 'Nearest outlet 4.2 km', 'risk', '-5 points', 'network', 'The location creates moderate delivery-radius overlap.'),
-        ],
-    },
-}
-
-
-STATUS_COLORS = {'Recommended': GREEN, 'Review': GOLD, 'High risk': RED}
 
 
 def _format_lakh(value: float) -> str:
     return f'₹{value:.1f} lakh'
 
+
+def _format_bytes(size_bytes: int) -> str:
+    if size_bytes < 1024:
+        return f'{size_bytes} B'
+    if size_bytes < 1024 * 1024:
+        return f'{size_bytes / 1024:.1f} KB'
+    return f'{size_bytes / (1024 * 1024):.1f} MB'
+
+
+def _status(status: str) -> None:
+    color = STATUS_COLORS.get(status, BURGUNDY)
+    ui.badge(status).style(f'background:{color};color:white;')
+
+
+def _metric(title: str, value: str, subtitle: str, icon: str) -> None:
+    with ui.card().classes('metric-card p-4 w-full'):
+        with ui.row().classes(
+            'w-full items-start justify-between no-wrap'
+        ):
+            with ui.column().classes('gap-1'):
+                ui.label(title).classes('text-xs font-semibold muted')
+                ui.label(value).classes('text-xl font-bold tracking-tight')
+                ui.label(subtitle).classes('text-[11px] muted')
+            with ui.element('div').classes('metric-icon'):
+                ui.icon(icon).classes('text-xl')
 
 
 def _nav_item(
@@ -169,9 +81,7 @@ def _nav_item(
     route: str | None = None,
     active: bool = False,
 ) -> None:
-    """Render a bright, readable sidebar navigation option."""
     classes = 'nav-button'
-
     if active:
         classes += ' nav-button-active'
 
@@ -188,20 +98,15 @@ def _nav_item(
         label,
         icon=icon,
         on_click=handle_click,
-    ).props(
-        'flat no-caps align=left'
-    ).classes(
-        classes
-    )
-
+    ).props('flat no-caps align=left').classes(classes)
     button.style(
         'color: #FFFFFF !important; font-weight: 700;'
         if active
-        else 'color: rgba(255,255,255,0.90) !important; font-weight: 600;'
+        else (
+            'color: rgba(255,255,255,0.90) !important; '
+            'font-weight: 600;'
+        )
     )
-
-
-
 
 
 def _render_shell(ai_chat: AIChatController) -> None:
@@ -210,217 +115,218 @@ def _render_shell(ai_chat: AIChatController) -> None:
         .app-drawer .nav-button .q-btn__content {
             color: rgba(255, 255, 255, 0.90) !important;
         }
-
         .app-drawer .nav-button-active .q-btn__content {
             color: #FFFFFF !important;
         }
         """
     )
 
-    drawer = ui.left_drawer(
-        value=True
-    ).classes(
+    drawer = ui.left_drawer(value=True).classes(
         'app-drawer p-4'
-    ).props(
-        'width=260 bordered'
-    )
+    ).props('width=260 bordered')
 
     with drawer:
-        with ui.column().classes(
-            'w-full h-full gap-2'
-        ):
-            ui.label(
-                'OPERATIONS'
-            ).classes(
+        with ui.column().classes('w-full h-full gap-2'):
+            ui.label('OPERATIONS').classes(
                 'text-[10px] font-bold tracking-[0.18em] '
                 'opacity-50 px-3 mt-3 mb-1'
             )
-
             _nav_item(
                 'Command Center',
                 'space_dashboard',
                 route='/command-center',
-                active=False,
             )
-
             _nav_item(
                 'Demand & Inventory',
                 'inventory_2',
                 route='/demand-inventory',
-                active=False,
             )
-
             _nav_item(
                 'Outlet Intelligence',
                 'location_on',
                 route='/outlet-intelligence',
                 active=True,
             )
-
             _nav_item(
                 'Network Intelligence',
                 'storefront',
                 route='/network-intelligence',
-                active=False,
             )
 
-            ui.label(
-                'INNOVATE'
-            ).classes(
+            ui.label('INNOVATE').classes(
                 'text-[10px] font-bold tracking-[0.18em] '
                 'opacity-50 px-3 mt-5 mb-1'
             )
-
             _nav_item(
                 'Product Innovation',
                 'science',
                 route='/product-innovation',
-                active=False,
             )
 
             ui.space()
-
             with ui.card().classes(
-                'w-full p-4 bg-white/10 border-0 '
-                'rounded-2xl text-white'
+                'w-full p-4 bg-white/10 border-0 rounded-2xl text-white'
             ):
                 with ui.row().classes(
                     'items-center gap-3 no-wrap w-full'
                 ):
-                    ui.image(
-                        '/assets/inventide_logo.png'
-                    ).classes(
+                    ui.image('/assets/inventide_logo.png').classes(
                         'w-10 h-10 object-cover rounded-full shrink-0'
                     )
-
-                    with ui.column().classes(
-                        'gap-0 min-w-0'
-                    ):
-                        ui.label(
-                            'VESPER'
-                        ).classes(
+                    with ui.column().classes('gap-0 min-w-0'):
+                        ui.label('VESPER').classes(
                             'text-sm font-black tracking-[0.16em] text-white'
                         )
-
-                        ui.label(
-                            'Supply Chain Intelligence'
-                        ).classes(
+                        ui.label('Supply Chain Intelligence').classes(
                             'text-[11px] text-white/90 whitespace-nowrap'
                         )
-
-                ui.separator().classes(
-                    'opacity-20 my-3'
-                )
-
-                ui.label(
-                    'AI-powered supply chain engine'
-                ).classes(
+                ui.separator().classes('opacity-20 my-3')
+                ui.label('AI-powered supply chain engine').classes(
                     'text-xs text-white/90 leading-relaxed'
                 )
-
-                ui.label(
-                    'Demo workspace · v0.1'
-                ).classes(
+                ui.label('Demo workspace · v0.1').classes(
                     'text-[10px] text-white/70 mt-2'
                 )
 
     with ui.header().classes(
-        'app-header h-16 px-4 md:px-7 '
-        'items-center justify-between'
+        'app-header h-16 px-4 md:px-7 items-center justify-between'
     ):
-        with ui.row().classes(
-            'items-center gap-3 no-wrap'
-        ):
+        with ui.row().classes('items-center gap-3 no-wrap'):
             ui.button(
                 icon='menu',
                 on_click=drawer.toggle,
-            ).props(
-                'flat round dense'
-            ).classes(
-                'lg:hidden'
-            )
-
-            ui.image(
-                '/assets/inventide_logo.png'
-            ).classes(
+            ).props('flat round dense').classes('lg:hidden')
+            ui.image('/assets/inventide_logo.png').classes(
                 'w-11 h-11 object-cover rounded-full'
             )
-
             with ui.column().classes('gap-0'):
-                ui.label(
-                    'SUPPLY CHAIN INTELLIGENCE'
-                ).classes(
+                ui.label('SUPPLY CHAIN INTELLIGENCE').classes(
                     'text-sm font-extrabold tracking-wide'
                 )
-
-                ui.label(
-                    'Powered by Inventide'
-                ).classes(
+                ui.label('Powered by Inventide').classes(
                     'text-[11px] muted'
                 )
 
-        with ui.row().classes(
-            'items-center gap-3'
-        ):
-            ui.badge(
-                'CONCEPT DATA',
-                color='secondary',
-            ).props(
+        with ui.row().classes('items-center gap-3'):
+            ui.badge('CONCEPT DATA', color='secondary').props(
                 'outline'
-            ).classes(
-                'desktop-only'
-            )
-
+            ).classes('desktop-only')
             ui.button(
                 'Ask AI',
                 icon='auto_awesome',
                 on_click=ai_chat.open,
-            ).props(
-                'unelevated no-caps'
-            ).classes(
-                'rounded-xl'
-            )
+            ).props('unelevated no-caps').classes('rounded-xl')
 
 
-
-
-def _metric(title: str, value: str, subtitle: str, icon: str) -> None:
-    with ui.card().classes('metric-card p-4 w-full'):
-        with ui.row().classes('w-full items-start justify-between no-wrap'):
-            with ui.column().classes('gap-1'):
-                ui.label(title).classes('text-xs font-semibold muted')
-                ui.label(value).classes('text-xl font-bold tracking-tight')
-                ui.label(subtitle).classes('text-[11px] muted')
-            with ui.element('div').classes('metric-icon'):
-                ui.icon(icon).classes('text-xl')
-
-
-def _status(status: str) -> None:
-    ui.badge(status).style(f'background:{STATUS_COLORS[status]};color:white;')
+def _get_tab_state() -> dict[str, Any]:
+    stored = app.storage.tab.get(OUTLET_STORAGE_KEY)
+    if (
+        not isinstance(stored, dict)
+        or stored.get('schema_version') != OUTLET_STATE_SCHEMA_VERSION
+        or stored.get('process_boot_id') != OUTLET_PROCESS_BOOT_ID
+        or not isinstance(stored.get('candidates'), dict)
+    ):
+        stored = {
+            'schema_version': OUTLET_STATE_SCHEMA_VERSION,
+            'process_boot_id': OUTLET_PROCESS_BOOT_ID,
+            'candidates': clone_default_candidates(),
+            'decisions': {},
+            'selected': None,
+        }
+        app.storage.tab[OUTLET_STORAGE_KEY] = stored
+    return stored
 
 
 @ui.page('/outlet-intelligence')
 async def outlet_intelligence_page() -> None:
     apply_theme()
-    ui.add_css('''
-        .location-map{border-radius:16px;overflow:hidden;border:1px solid rgba(90,21,52,.09)}
-        .candidate-row{border:1px solid rgba(90,21,52,.09);border-radius:14px;background:#fffdf8;transition:160ms ease}
-        .candidate-row:hover{transform:translateY(-1px);box-shadow:0 10px 24px rgba(59,13,34,.07)}
-        .verdict-panel{background:linear-gradient(150deg,#3B0D22,#5A1534);color:white;border-radius:18px}
-    ''')
+    ui.add_css(
+        '''
+        .location-map {
+            border-radius: 16px;
+            overflow: hidden;
+            border: 1px solid rgba(90,21,52,.09);
+        }
+        .candidate-row {
+            border: 1px solid rgba(90,21,52,.09);
+            border-radius: 14px;
+            background: #fffdf8;
+            transition: 160ms ease;
+        }
+        .candidate-row:hover {
+            transform: translateY(-1px);
+            box-shadow: 0 10px 24px rgba(59,13,34,.07);
+        }
+        .verdict-panel {
+            background: linear-gradient(150deg,#3B0D22,#5A1534);
+            color: white;
+            border-radius: 18px;
+        }
+        .address-suggestion {
+            border: 1px solid rgba(90,21,52,.10);
+            border-radius: 12px;
+            background: #fffdf8;
+        }
+        .address-suggestion:hover {
+            background: rgba(90,21,52,.04);
+        }
+        .document-row {
+            border: 1px solid rgba(90,21,52,.09);
+            border-radius: 12px;
+            background: rgba(255,253,248,.8);
+        }
+        .evidence-column {
+            border-left: 3px solid rgba(90,21,52,.18);
+            padding-left: 12px;
+        }
+        '''
+    )
+
     ai_chat = create_ai_chat(
         page_name='Outlet Intelligence',
         page_context=PAGE_CONTEXTS['outlet_intelligence'],
     )
     _render_shell(ai_chat)
 
-    state = {'selected': None, 'run': 0, 'decisions': {}}
+    # ``app.storage.tab`` is intentionally volatile and unique to this browser
+    # tab, but NiceGUI only exposes it after the WebSocket is connected.
+    # This is what lets edits survive route navigation while a server restart
+    # restores the original four demo candidates.
+    await ui.context.client.connected()
+    tab_state = _get_tab_state()
+    candidates: dict[str, dict[str, Any]] = tab_state['candidates']
+    decisions: dict[str, str] = tab_state.setdefault('decisions', {})
+    page_state = {
+        'selected': tab_state.get('selected'),
+        'analysis_run': 0,
+    }
     refs: dict[str, Any] = {}
     marker_layers: dict[str, Any] = {}
+    map_event_name = f'outlet-candidate-{uuid.uuid4().hex}'
+    location_service = create_location_service()
+    document_service = OutletDocumentAnalysisService()
 
-    def show_sources(signal: tuple[str, str, str, str, str, str]) -> None:
-        title, value, tone, points, source_key, evidence = signal
-        source_name, source_type, freshness = SOURCE_CATALOG[source_key]
+    def persist_state() -> None:
+        tab_state['selected'] = page_state['selected']
+        tab_state['candidates'] = candidates
+        tab_state['decisions'] = decisions
+        app.storage.tab[OUTLET_STORAGE_KEY] = tab_state
+
+    def update_candidate_count() -> None:
+        if 'candidate_count' in refs:
+            refs['candidate_count'].set_text(
+                f'{len(candidates)} CANDIDATE'
+                f'{"S" if len(candidates) != 1 else ""}'
+            )
+
+    def show_sources(
+        signal: tuple[str, str, str, str, str, str]
+    ) -> None:
+        title, value, _tone, points, source_key, evidence = signal
+        source_name, source_type, freshness = SOURCE_CATALOG.get(
+            source_key,
+            ('Prototype source', 'Simulated evidence', 'Current demo'),
+        )
         refs['source_content'].clear()
         with refs['source_content']:
             ui.label(title).classes('text-lg font-bold')
@@ -428,218 +334,1510 @@ async def outlet_intelligence_page() -> None:
             ui.separator().classes('my-3')
             ui.label(source_name).classes('text-sm font-bold')
             ui.label(source_type).classes('text-xs muted')
-            ui.badge(freshness, color='primary').props('outline').classes('mt-2')
-            ui.label(evidence).classes('text-sm leading-relaxed mt-3')
+            ui.badge(freshness, color='primary').props(
+                'outline'
+            ).classes('mt-2')
+            ui.label(evidence).classes(
+                'text-sm leading-relaxed mt-3'
+            )
         refs['source_dialog'].open()
 
     def set_decision(decision: str) -> None:
-        candidate_id = state['selected']
-        if candidate_id is None:
+        candidate_id = page_state['selected']
+        if candidate_id not in candidates:
             return
-        state['decisions'][candidate_id] = decision
-        refs['decision'].set_text(f'Workflow status: {decision}')
-        ui.notify(f"{CANDIDATES[candidate_id]['name']} marked as {decision}.", type='positive')
+        decisions[candidate_id] = decision
+        persist_state()
+        if 'decision' in refs:
+            refs['decision'].set_text(f'Workflow status: {decision}')
+        ui.notify(
+            f"{candidates[candidate_id]['name']} marked as {decision}.",
+            type='positive',
+        )
+
+    def render_document_analysis(candidate: dict[str, Any]) -> None:
+        raw = candidate.get('document_analysis')
+        if not isinstance(raw, dict):
+            with ui.card().classes('surface w-full p-5 mt-4'):
+                ui.label('DOCUMENT INTELLIGENCE').classes(
+                    'section-kicker'
+                )
+                ui.label('No document analysis yet').classes(
+                    'text-lg font-bold'
+                )
+                ui.label(
+                    'Upload source files or add site notes, save the '
+                    'candidate, and run Analyze.',
+                ).classes('text-sm muted mt-1')
+            return
+
+        source_mode = str(raw.get('source_mode') or 'demo')
+        mode_label = (
+            'VESPER RAG ENGINE'
+            if source_mode == 'openai'
+            else 'VESPER LOCAL RAG FALLBACK'
+        )
+        mode_color = 'positive' if source_mode == 'openai' else 'secondary'
+
+        with ui.card().classes('surface w-full p-5 mt-4'):
+            with ui.row().classes(
+                'w-full items-start justify-between gap-3'
+            ):
+                with ui.column().classes('gap-0'):
+                    ui.label('DOCUMENT INTELLIGENCE').classes(
+                        'section-kicker'
+                    )
+                    ui.label('Evidence extracted from candidate files').classes(
+                        'text-lg font-bold'
+                    )
+                ui.badge(mode_label, color=mode_color).props('outline')
+
+            ui.label(str(raw.get('summary') or '')).classes(
+                'text-sm leading-relaxed mt-3'
+            )
+
+            with ui.grid(columns=2).classes(
+                'w-full gap-4 mt-4 max-[850px]:grid-cols-1'
+            ):
+                with ui.column().classes('gap-2'):
+                    ui.label('Positive signals').classes('text-sm font-bold')
+                    values = raw.get('positive_signals') or []
+                    if not values:
+                        ui.label('None extracted.').classes('text-xs muted')
+                    for value in values:
+                        with ui.row().classes('items-start gap-2 no-wrap'):
+                            ui.icon('check_circle').style(f'color:{GREEN};')
+                            ui.label(str(value)).classes(
+                                'text-sm leading-relaxed'
+                            )
+
+                with ui.column().classes('gap-2'):
+                    ui.label('Risks and constraints').classes(
+                        'text-sm font-bold'
+                    )
+                    values = raw.get('risks') or []
+                    if not values:
+                        ui.label('None extracted.').classes('text-xs muted')
+                    for value in values:
+                        with ui.row().classes('items-start gap-2 no-wrap'):
+                            ui.icon('warning_amber').style(f'color:{RED};')
+                            ui.label(str(value)).classes(
+                                'text-sm leading-relaxed'
+                            )
+
+                with ui.column().classes('gap-2'):
+                    ui.label('Lease obligations').classes(
+                        'text-sm font-bold'
+                    )
+                    values = raw.get('lease_obligations') or []
+                    if not values:
+                        ui.label('None explicitly extracted.').classes(
+                            'text-xs muted'
+                        )
+                    for value in values:
+                        ui.label(f'• {value}').classes(
+                            'text-sm leading-relaxed'
+                        )
+
+                with ui.column().classes('gap-2'):
+                    ui.label('Accessibility notes').classes(
+                        'text-sm font-bold'
+                    )
+                    values = raw.get('accessibility_notes') or []
+                    if not values:
+                        ui.label('None explicitly extracted.').classes(
+                            'text-xs muted'
+                        )
+                    for value in values:
+                        ui.label(f'• {value}').classes(
+                            'text-sm leading-relaxed'
+                        )
+
+                with ui.column().classes('gap-2'):
+                    ui.label('Missing information').classes(
+                        'text-sm font-bold'
+                    )
+                    for value in raw.get('missing_information') or []:
+                        ui.label(f'• {value}').classes(
+                            'text-sm leading-relaxed'
+                        )
+
+                with ui.column().classes('gap-2'):
+                    ui.label('Recommended follow-up').classes(
+                        'text-sm font-bold'
+                    )
+                    for value in raw.get('follow_up_questions') or []:
+                        ui.label(f'• {value}').classes(
+                            'text-sm leading-relaxed'
+                        )
+
+            evidence = raw.get('evidence') or []
+            if evidence:
+                ui.separator().classes('my-4')
+                ui.label('File-level evidence').classes('text-sm font-bold')
+                with ui.column().classes('w-full gap-3 mt-2'):
+                    for item in evidence:
+                        if not isinstance(item, dict):
+                            continue
+                        with ui.column().classes('gap-0 evidence-column'):
+                            with ui.row().classes(
+                                'items-center gap-2 flex-wrap'
+                            ):
+                                ui.label(
+                                    str(item.get('document_name') or 'Document')
+                                ).classes('text-sm font-bold')
+                                ui.badge(
+                                    str(item.get('confidence') or 'low').upper(),
+                                    color='primary',
+                                ).props('outline')
+                            ui.label(
+                                str(item.get('finding') or '')
+                            ).classes('text-xs muted leading-relaxed')
+
+            warnings = raw.get('warnings') or []
+            for warning in warnings:
+                with ui.row().classes(
+                    'items-start gap-2 no-wrap mt-3 p-3 rounded-xl '
+                    'bg-amber-50 border border-amber-200'
+                ):
+                    ui.icon('info').classes('text-amber-700')
+                    ui.label(str(warning)).classes(
+                        'text-xs text-amber-900 leading-relaxed'
+                    )
 
     def render_details(candidate_id: str) -> None:
-        c = CANDIDATES[candidate_id]
+        candidate = candidates.get(candidate_id)
+        if candidate is None:
+            refs['details'].clear()
+            return
+
+        page_state['selected'] = candidate_id
+        persist_state()
         refs['details'].clear()
         with refs['details']:
-            with ui.row().classes('w-full items-start justify-between'):
+            with ui.row().classes(
+                'w-full items-start justify-between gap-3'
+            ):
                 with ui.column().classes('gap-1'):
                     ui.label('AI LOCATION VERDICT').classes('section-kicker')
-                    ui.label(c['name']).classes('text-2xl font-extrabold')
-                    ui.label(c['address']).classes('text-sm muted')
+                    ui.label(candidate['name']).classes(
+                        'text-2xl font-extrabold'
+                    )
+                    ui.label(candidate['address']).classes('text-sm muted')
                 with ui.column().classes('items-end gap-1'):
-                    _status(c['status'])
+                    _status(candidate['status'])
                     refs['decision'] = ui.label(
-                        f"Workflow status: {state['decisions'].get(candidate_id, 'Not decided')}"
+                        'Workflow status: '
+                        f"{decisions.get(candidate_id, 'Not decided')}"
                     ).classes('text-xs muted')
 
-            with ui.grid(columns=5).classes('w-full gap-4 mt-4 max-[1100px]:grid-cols-2 max-[650px]:grid-cols-1'):
-                _metric('Location score', f"{c['score']} / 100", 'AI composite score', 'stars')
-                _metric('Expected monthly sales', _format_lakh(c['sales']), 'Base scenario', 'currency_rupee')
-                _metric('Contribution margin', f"{c['margin']:.1f}%", 'After operating costs', 'percent')
-                _metric('Break-even', f"{c['break_even']} months", 'Estimated payback', 'schedule')
-                _metric('Cannibalization risk', c['cannibalization'], 'Existing network overlap', 'store')
+            with ui.grid(columns=5).classes(
+                'w-full gap-4 mt-4 max-[1100px]:grid-cols-2 '
+                'max-[650px]:grid-cols-1'
+            ):
+                _metric(
+                    'Location score',
+                    f"{candidate['score']} / 100",
+                    'Deterministic composite score',
+                    'stars',
+                )
+                _metric(
+                    'Expected monthly sales',
+                    _format_lakh(float(candidate['sales'])),
+                    'Simulated base scenario',
+                    'currency_rupee',
+                )
+                _metric(
+                    'Contribution margin',
+                    f"{float(candidate['margin']):.1f}%",
+                    'Prototype operating model',
+                    'percent',
+                )
+                _metric(
+                    'Break-even',
+                    f"{candidate['break_even']} months",
+                    'Prototype payback estimate',
+                    'schedule',
+                )
+                _metric(
+                    'Cannibalization',
+                    str(candidate['cannibalization']),
+                    'Simulated network overlap',
+                    'hub',
+                )
 
-            with ui.grid(columns=12).classes('w-full gap-4 mt-4 max-[1050px]:grid-cols-1'):
-                with ui.card().classes('surface col-span-7 p-5 w-full max-[1050px]:col-span-1'):
-                    ui.label('Information supplied by the expansion team').classes('text-lg font-bold')
-                    ui.label('Required inputs plus optional structured and unstructured evidence').classes('text-xs muted')
-                    fields = {
-                        'Monthly rent': _format_lakh(c['rent']),
-                        'Square footage': f"{c['sqft']:,} sq. ft.",
-                        **c['optional'],
-                        'Documents': f"{len(c['documents'])} uploaded items",
-                    }
-                    with ui.grid(columns=3).classes('w-full gap-3 mt-4 max-[750px]:grid-cols-1'):
-                        for title, value in fields.items():
-                            with ui.card().classes('p-3 rounded-xl shadow-none border border-[#eee4e8]'):
-                                ui.label(title.upper()).classes('text-[9px] font-bold muted')
-                                ui.label(value).classes('text-sm font-semibold')
-                    ui.label('UNSTRUCTURED SITE NOTES').classes('section-kicker mt-4')
-                    ui.label(c['notes']).classes('text-sm leading-relaxed')
-                    ui.label('UPLOADED EVIDENCE').classes('section-kicker mt-4')
-                    for document in c['documents']:
-                        with ui.row().classes('items-center gap-2 mt-1'):
+            with ui.grid(columns=5).classes(
+                'w-full gap-4 mt-4 max-[1050px]:grid-cols-1'
+            ):
+                with ui.card().classes(
+                    'surface col-span-2 p-5 w-full max-[1050px]:col-span-1'
+                ):
+                    with ui.row().classes(
+                        'w-full items-start justify-between gap-3'
+                    ):
+                        with ui.column().classes('gap-0'):
+                            ui.label('SUBMITTED LOCATION RECORD').classes(
+                                'section-kicker'
+                            )
+                            ui.label('Team inputs and files').classes(
+                                'text-lg font-bold'
+                            )
+                        ui.button(
+                            'Edit',
+                            icon='edit',
+                            on_click=lambda cid=candidate_id: (
+                                open_candidate_editor(cid)
+                            ),
+                        ).props('outline dense no-caps')
+
+                    with ui.grid(columns=2).classes(
+                        'w-full gap-3 mt-4 max-[650px]:grid-cols-1'
+                    ):
+                        for label, value in (
+                            ('Monthly rent', _format_lakh(float(candidate['rent']))),
+                            ('Square footage', f"{candidate['sqft']:,} sq. ft."),
+                            ('City', candidate.get('city') or 'Not supplied'),
+                            ('PIN code', candidate.get('pincode') or 'Not supplied'),
+                        ):
+                            with ui.column().classes('gap-0'):
+                                ui.label(label).classes(
+                                    'text-[10px] font-bold tracking-wide muted'
+                                )
+                                ui.label(str(value)).classes('text-sm font-bold')
+
+                    optional = candidate.get('optional') or {}
+                    ui.separator().classes('my-4')
+                    for key in ('Frontage', 'Floor', 'Parking'):
+                        value = optional.get(key) or 'Not supplied'
+                        ui.label(f'{key}: {value}').classes('text-sm')
+
+                    ui.label('Location notes').classes(
+                        'text-sm font-bold mt-4'
+                    )
+                    ui.label(
+                        candidate.get('notes') or 'No notes supplied.'
+                    ).classes('text-sm muted leading-relaxed')
+
+                    ui.label('Documents').classes('text-sm font-bold mt-4')
+                    documents = candidate.get('documents') or []
+                    if not documents:
+                        ui.label('No documents uploaded.').classes(
+                            'text-xs muted'
+                        )
+                    for document in documents:
+                        with ui.row().classes(
+                            'items-center gap-2 no-wrap mt-1'
+                        ):
                             ui.icon('description').classes('text-primary')
-                            ui.label(document).classes('text-sm')
+                            with ui.column().classes('gap-0 min-w-0'):
+                                ui.label(
+                                    str(document.get('name') or 'Document')
+                                ).classes('text-sm font-medium truncate')
+                                source = (
+                                    'Preloaded demo metadata'
+                                    if document.get('source') == 'demo'
+                                    else _format_bytes(
+                                        int(document.get('size_bytes') or 0)
+                                    )
+                                )
+                                ui.label(source).classes('text-[10px] muted')
 
-                with ui.card().classes('verdict-panel col-span-5 p-5 w-full max-[1050px]:col-span-1'):
-                    with ui.row().classes('w-full items-center justify-between'):
+                with ui.card().classes(
+                    'verdict-panel col-span-3 p-5 w-full '
+                    'max-[1050px]:col-span-1'
+                ):
+                    with ui.row().classes(
+                        'w-full items-center justify-between gap-3'
+                    ):
                         ui.label('AI RECOMMENDATION').classes('ai-badge')
-                        ui.label(f"{c['score']} / 100").classes('text-xl font-black text-amber-200')
-                    ui.label(c['verdict']).classes('text-2xl font-extrabold mt-4')
-                    ui.label(c['summary']).classes('text-sm text-white/75 leading-relaxed mt-2')
+                        ui.label(
+                            f"{candidate['score']} / 100"
+                        ).classes('text-xl font-black text-amber-200')
+                    ui.label(candidate['verdict']).classes(
+                        'text-2xl font-extrabold mt-4'
+                    )
+                    ui.label(candidate['summary']).classes(
+                        'text-sm text-white/75 leading-relaxed mt-2'
+                    )
                     ui.separator().classes('opacity-20 my-4')
-                    ui.label('RECOMMENDED FORMAT').classes('text-[10px] tracking-wider text-white/55')
-                    ui.label(c['format']).classes('text-lg font-bold text-amber-200')
+                    ui.label('RECOMMENDED FORMAT').classes(
+                        'text-[10px] tracking-wider text-white/55'
+                    )
+                    ui.label(candidate['format']).classes(
+                        'text-lg font-bold text-amber-200'
+                    )
+                    ui.label(
+                        f"Analysis status: {candidate.get('analysis_status', 'Unknown')}"
+                    ).classes('text-xs text-white/60 mt-4')
 
+            render_document_analysis(candidate)
+
+            signals = candidate.get('signals') or []
             with ui.card().classes('surface w-full p-5 mt-4'):
-                with ui.row().classes('w-full items-start justify-between'):
+                with ui.row().classes(
+                    'w-full items-start justify-between gap-3'
+                ):
                     with ui.column().classes('gap-0'):
-                        ui.label('Explainable verdict and source evidence').classes('text-lg font-bold')
-                        ui.label('AI-enriched signals collected after candidate selection').classes('text-xs muted')
-                    ui.badge(f"{len(c['signals'])} SIGNALS", color='primary').props('outline')
+                        ui.label(
+                            'Explainable verdict and source evidence'
+                        ).classes('text-lg font-bold')
+                        ui.label(
+                            'Numerical outputs are calculated by deterministic '
+                            'prototype logic; external location signals remain simulated.',
+                        ).classes('text-xs muted')
+                    ui.badge(
+                        f'{len(signals)} SIGNALS',
+                        color='primary',
+                    ).props('outline')
 
-                with ui.grid(columns=3).classes('w-full gap-3 mt-4 max-[1000px]:grid-cols-2 max-[700px]:grid-cols-1'):
-                    for signal in c['signals']:
-                        title, value, tone, points, source_key, evidence = signal
+                with ui.grid(columns=3).classes(
+                    'w-full gap-3 mt-4 max-[1000px]:grid-cols-2 '
+                    'max-[700px]:grid-cols-1'
+                ):
+                    for signal in signals:
+                        title, value, tone, points, _source_key, evidence = signal
                         positive = tone == 'positive'
                         color = GREEN if positive else RED
                         icon = 'trending_up' if positive else 'warning_amber'
-                        with ui.card().classes('p-4 rounded-xl shadow-none border border-[#eee4e8]').style(
-                            f'border-left:4px solid {color};'
-                        ):
-                            with ui.row().classes('w-full items-start justify-between gap-2'):
-                                with ui.row().classes('items-start gap-2 no-wrap'):
+                        with ui.card().classes(
+                            'p-4 rounded-xl shadow-none border '
+                            'border-[#eee4e8]'
+                        ).style(f'border-left:4px solid {color};'):
+                            with ui.row().classes(
+                                'w-full items-start justify-between gap-2'
+                            ):
+                                with ui.row().classes(
+                                    'items-start gap-2 no-wrap'
+                                ):
                                     ui.icon(icon).style(f'color:{color};')
                                     with ui.column().classes('gap-0'):
-                                        ui.label(title).classes('text-sm font-bold')
+                                        ui.label(title).classes(
+                                            'text-sm font-bold'
+                                        )
                                         ui.label(value).classes('text-xs muted')
-                                ui.badge(points).style(f'background:{color};color:white;')
-                            ui.label(evidence).classes('text-xs muted leading-relaxed mt-3')
+                                ui.badge(points).style(
+                                    f'background:{color};color:white;'
+                                )
+                            ui.label(evidence).classes(
+                                'text-xs muted leading-relaxed mt-3'
+                            )
                             ui.button(
                                 'View source',
                                 icon='source',
                                 on_click=lambda s=signal: show_sources(s),
-                            ).props('flat dense no-caps color=primary').classes('text-xs mt-2')
+                            ).props(
+                                'flat dense no-caps color=primary'
+                            ).classes('text-xs mt-2')
 
-            with ui.row().classes('w-full justify-end gap-2 mt-4'):
-                ui.button('Request more information', icon='help_outline', on_click=lambda: set_decision('More information requested')).props('outline no-caps').classes('rounded-xl')
-                ui.button('Reject candidate', icon='close', on_click=lambda: set_decision('Rejected')).props('outline no-caps color=negative').classes('rounded-xl')
-                ui.button('Shortlist candidate', icon='bookmark_added', on_click=lambda: set_decision('Shortlisted')).props('unelevated no-caps').classes('rounded-xl')
+            with ui.row().classes('w-full justify-end gap-2 mt-4 flex-wrap'):
+                ui.button(
+                    'Request more information',
+                    icon='help_outline',
+                    on_click=lambda: set_decision(
+                        'More information requested'
+                    ),
+                ).props('outline no-caps').classes('rounded-xl')
+                ui.button(
+                    'Reject candidate',
+                    icon='close',
+                    on_click=lambda: set_decision('Rejected'),
+                ).props('outline no-caps color=negative').classes(
+                    'rounded-xl'
+                )
+                ui.button(
+                    'Shortlist candidate',
+                    icon='bookmark_added',
+                    on_click=lambda: set_decision('Shortlisted'),
+                ).props('unelevated no-caps').classes('rounded-xl')
+
+    async def bind_marker(candidate_id: str, layer: Any) -> None:
+        candidate = candidates[candidate_id]
+        await candidate_map.initialized()
+        candidate_map.run_layer_method(
+            layer.id,
+            'bindTooltip',
+            f"{candidate['name']} · {candidate['status']}",
+        )
+        cid_json = json.dumps(candidate_id)
+        event_json = json.dumps(map_event_name)
+        candidate_map.run_layer_method(
+            layer.id,
+            ':on',
+            '"click"',
+            (
+                'function() {'
+                f' emitEvent({event_json}, {{candidate_id: {cid_json}}});'
+                ' }'
+            ),
+        )
+
+    async def rebuild_markers(
+        *,
+        focus_candidate_id: str | None = None,
+    ) -> None:
+        await candidate_map.initialized()
+        for layer in list(marker_layers.values()):
+            try:
+                candidate_map.remove_layer(layer)
+            except Exception:
+                # A layer may already have been removed after a reconnect.
+                pass
+        marker_layers.clear()
+
+        for candidate_id, candidate in candidates.items():
+            lat = candidate.get('lat')
+            lng = candidate.get('lng')
+            if not isinstance(lat, (int, float)) or not isinstance(
+                lng,
+                (int, float),
+            ):
+                continue
+            layer = candidate_map.generic_layer(
+                name='circleMarker',
+                args=[
+                    [float(lat), float(lng)],
+                    {
+                        'radius': 10,
+                        'color': '#FFFFFF',
+                        'weight': 3,
+                        'fillColor': STATUS_COLORS.get(
+                            str(candidate.get('status')),
+                            BURGUNDY,
+                        ),
+                        'fillOpacity': 1.0,
+                    },
+                ],
+            )
+            marker_layers[candidate_id] = layer
+            await bind_marker(candidate_id, layer)
+
+        if focus_candidate_id in candidates:
+            focused = candidates[focus_candidate_id]
+            if isinstance(focused.get('lat'), (int, float)) and isinstance(
+                focused.get('lng'),
+                (int, float),
+            ):
+                candidate_map.run_map_method(
+                    'setView',
+                    [float(focused['lat']), float(focused['lng'])],
+                    12,
+                )
+        elif not candidates:
+            candidate_map.run_map_method('setView', [22.7, 79.4], 5)
 
     async def analyze(candidate_id: str) -> None:
-        c = CANDIDATES[candidate_id]
-        state['selected'] = candidate_id
-        state['run'] += 1
-        run_id = state['run']
+        candidate = candidates.get(candidate_id)
+        if candidate is None:
+            return
+
+        page_state['selected'] = candidate_id
+        page_state['analysis_run'] += 1
+        run_id = page_state['analysis_run']
+        persist_state()
+
         refs['analysis'].clear()
         refs['details'].clear()
         with refs['analysis']:
             with ui.card().classes('surface w-full p-5'):
                 ui.label('AI LOCATION ANALYSIS').classes('section-kicker')
-                ui.label(f"Evaluating {c['name']}").classes('text-xl font-bold')
-                progress_text = ui.label('Reading candidate record…').classes('text-sm muted')
-                progress = ui.linear_progress(value=0).props('rounded color=primary track-color=grey-3').classes('w-full mt-4')
-        steps = [
-            'Reading team-submitted documents',
-            'Resolving address and trade area',
-            'Checking competition and demand generators',
-            'Estimating sales and cannibalization',
-            'Generating explainable investment verdict',
-        ]
-        for index, step in enumerate(steps, 1):
-            if run_id != state['run']:
-                return
-            progress_text.set_text(f'{step}…')
-            progress.value = index / len(steps)
+                ui.label(f"Evaluating {candidate['name']}").classes(
+                    'text-xl font-bold'
+                )
+                progress_text = ui.label(
+                    'Validating the candidate record…'
+                ).classes('text-sm muted')
+                progress = ui.linear_progress(value=0).props(
+                    'rounded color=primary track-color=grey-3'
+                ).classes('w-full mt-4')
+
+        async def set_progress(value: float, text: str) -> bool:
+            if run_id != page_state['analysis_run']:
+                return False
+            progress_text.set_text(text)
+            progress.value = value
             progress.update()
-            await asyncio.sleep(0.45)
-        if run_id == state['run']:
+            await asyncio.sleep(0.18)
+            return True
+
+        if not await set_progress(0.15, 'Reading structured site inputs…'):
+            return
+        if not await set_progress(0.32, 'Preparing uploaded files…'):
+            return
+
+        try:
+            document_analysis = await document_service.analyze(candidate)
+        except OutletDocumentAnalysisError as exc:
+            refs['analysis'].clear()
+            ui.notify(str(exc), type='negative')
+            return
+
+        if run_id != page_state['analysis_run']:
+            return
+        candidate['document_analysis'] = document_analysis.model_dump()
+        candidate['analysis_mode'] = document_analysis.source_mode
+
+        if not await set_progress(
+            0.67,
+            'Calculating location economics and risk signals…',
+        ):
+            return
+        calculate_location_analysis(candidate, candidates)
+
+        if not await set_progress(
+            0.86,
+            'Building the explainable management verdict…',
+        ):
+            return
+        persist_state()
+        candidate_list.refresh()
+        update_candidate_count()
+        await rebuild_markers(focus_candidate_id=candidate_id)
+
+        if run_id == page_state['analysis_run']:
             refs['analysis'].clear()
             render_details(candidate_id)
-            ui.notify(f"AI verdict generated for {c['name']}", type='positive', icon='verified')
+            analysis_label = (
+                'Vesper RAG Engine'
+                if document_analysis.source_mode == 'openai'
+                else 'Vesper local RAG fallback'
+            )
+            ui.notify(
+                f"Verdict generated for {candidate['name']} using "
+                f'{analysis_label}.',
+                type='positive',
+                icon='verified',
+            )
 
     async def marker_event(event: Any) -> None:
-        candidate_id = event.args.get('candidate_id') if event.args else None
-        if candidate_id in CANDIDATES:
+        args = event.args if isinstance(event.args, dict) else {}
+        candidate_id = args.get('candidate_id')
+        if candidate_id in candidates:
             await analyze(candidate_id)
+
+    def open_candidate_editor(candidate_id: str | None = None) -> None:
+        is_new = candidate_id is None
+        if is_new:
+            working_id = f'candidate-{uuid.uuid4().hex[:10]}'
+            draft = create_empty_candidate(working_id)
+        else:
+            if candidate_id not in candidates:
+                ui.notify('Candidate no longer exists.', type='warning')
+                return
+            working_id = str(candidate_id)
+            draft = deepcopy(candidates[working_id])
+
+        original = deepcopy(draft)
+        search_state: dict[str, Any] = {
+            'generation': 0,
+            'suggestions': [],
+            'suppress_value': '',
+            'resolved_address': str(draft.get('address') or ''),
+        }
+
+        with ui.dialog() as dialog:
+            dialog.props('persistent')
+            with ui.card().classes(
+                'w-[920px] max-w-[96vw] max-h-[92vh] overflow-auto '
+                'p-6 rounded-2xl'
+            ):
+                with ui.row().classes(
+                    'w-full items-start justify-between gap-3'
+                ):
+                    with ui.column().classes('gap-0'):
+                        ui.label(
+                            'ADD SHORTLISTED LOCATION'
+                            if is_new
+                            else 'EDIT SHORTLISTED LOCATION'
+                        ).classes('section-kicker')
+                        ui.label(
+                            'Create a candidate record'
+                            if is_new
+                            else f"Update {draft.get('name', 'candidate')}"
+                        ).classes('text-2xl font-extrabold')
+                        ui.label(
+                            'Address, monthly rent and square footage are '
+                            'required. Location name, files and site notes are '
+                            'optional.',
+                        ).classes('text-sm muted')
+                    ui.button(
+                        icon='close',
+                        on_click=dialog.close,
+                    ).props('flat round dense')
+
+                ui.separator().classes('my-4')
+
+                with ui.grid(columns=2).classes(
+                    'w-full gap-4 max-[760px]:grid-cols-1'
+                ):
+                    name_input = ui.input(
+                        'Location name',
+                        value=str(draft.get('name') or ''),
+                        placeholder='Example: Phoenix Marketcity, Pune',
+                    ).props('outlined')
+                    rent_input = ui.number(
+                        'Monthly rent in lakh INR *',
+                        value=float(draft.get('rent') or 0.0),
+                        min=0.01,
+                        step=0.05,
+                    ).props('outlined')
+
+                address_input = ui.input(
+                    'Full address *',
+                    value=str(draft.get('address') or ''),
+                    placeholder='Start typing an Indian locality, road or POI',
+                ).props('outlined clearable').classes('w-full mt-3')
+
+                with ui.row().classes(
+                    'w-full items-center justify-between gap-3 mt-1'
+                ):
+                    provider_text = (
+                        f'Live suggestions: {location_service.provider_label}'
+                        if location_service.is_live
+                        else (
+                            'Offline demo suggestions active. Add '
+                            'MAPPLS_REST_KEY for live Indian search.'
+                        )
+                    )
+                    address_status = ui.label(provider_text).classes(
+                        'text-[11px] muted'
+                    )
+                    ui.label('Type at least 3 characters').classes(
+                        'text-[11px] muted'
+                    )
+
+                @ui.refreshable
+                def suggestion_list() -> None:
+                    suggestions: list[LocationSuggestion] = search_state[
+                        'suggestions'
+                    ]
+                    if not suggestions:
+                        return
+                    with ui.card().classes(
+                        'w-full p-2 mt-2 shadow-none rounded-xl '
+                        'border border-[#eee4e8]'
+                    ):
+                        for suggestion in suggestions:
+                            async def choose(
+                                selected: LocationSuggestion = suggestion,
+                            ) -> None:
+                                address_status.set_text(
+                                    f'Resolving {selected.display_name}…'
+                                )
+                                resolved = await location_service.resolve(
+                                    selected
+                                )
+                                address = (
+                                    resolved.formatted_address
+                                    or selected.formatted_address
+                                )
+                                search_state['suppress_value'] = address
+                                search_state['resolved_address'] = address
+                                address_input.set_value(address)
+                                if is_new and not str(name_input.value or '').strip():
+                                    name_input.set_value(
+                                        resolved.display_name
+                                        or selected.display_name
+                                    )
+                                city_input.set_value(resolved.city)
+                                state_input.set_value(resolved.state)
+                                pincode_input.set_value(resolved.postal_code)
+                                if resolved.latitude is not None:
+                                    latitude_input.set_value(
+                                        resolved.latitude
+                                    )
+                                if resolved.longitude is not None:
+                                    longitude_input.set_value(
+                                        resolved.longitude
+                                    )
+                                draft['address_provider'] = resolved.provider
+                                draft['provider_place_id'] = (
+                                    resolved.provider_id
+                                )
+                                draft['address_confirmed'] = True
+                                search_state['suggestions'] = []
+                                suggestion_list.refresh()
+                                if resolved.has_coordinates:
+                                    address_status.set_text(
+                                        'Address selected and map coordinates resolved.'
+                                    )
+                                else:
+                                    warning = location_service.last_warning
+                                    address_status.set_text(
+                                        warning
+                                        or (
+                                            'Address selected. Coordinate access '
+                                            'is unavailable; enter latitude and '
+                                            'longitude below.'
+                                        )
+                                    )
+
+                            with ui.button(
+                                on_click=choose,
+                            ).props(
+                                'flat no-caps align=left'
+                            ).classes(
+                                'address-suggestion w-full p-2 text-left'
+                            ):
+                                with ui.row().classes(
+                                    'items-start gap-2 no-wrap w-full'
+                                ):
+                                    ui.icon('location_on').classes(
+                                        'text-primary mt-1'
+                                    )
+                                    with ui.column().classes(
+                                        'gap-0 items-start min-w-0'
+                                    ):
+                                        ui.label(
+                                            suggestion.display_name
+                                        ).classes(
+                                            'text-sm font-bold text-left'
+                                        )
+                                        ui.label(
+                                            suggestion.formatted_address
+                                        ).classes(
+                                            'text-xs muted text-left '
+                                            'whitespace-normal'
+                                        )
+                                        ui.label(
+                                            suggestion.provider.upper()
+                                        ).classes(
+                                            'text-[9px] font-bold tracking-wide muted'
+                                        )
+
+                suggestion_list()
+
+                async def address_changed(event: Any) -> None:
+                    value = str(event.value or '').strip()
+                    if value == search_state.get('suppress_value'):
+                        search_state['suppress_value'] = ''
+                        return
+                    draft['address_confirmed'] = False
+                    draft['address_provider'] = 'manual'
+                    draft['provider_place_id'] = ''
+                    if value != search_state.get('resolved_address'):
+                        # Never keep a stale map point after the user edits the
+                        # address manually. A suggestion, geocode result, or
+                        # explicit coordinate entry must establish the new pin.
+                        latitude_input.set_value(None)
+                        longitude_input.set_value(None)
+                        search_state['resolved_address'] = ''
+                    search_state['generation'] += 1
+                    generation = search_state['generation']
+                    search_state['suggestions'] = []
+                    suggestion_list.refresh()
+                    if len(value) < 3:
+                        address_status.set_text(
+                            'Type at least 3 characters for suggestions.'
+                        )
+                        return
+                    address_status.set_text('Searching Indian addresses…')
+                    await asyncio.sleep(0.40)
+                    if generation != search_state['generation']:
+                        return
+                    suggestions = await location_service.suggest(value, limit=6)
+                    if generation != search_state['generation']:
+                        return
+                    search_state['suggestions'] = suggestions
+                    suggestion_list.refresh()
+                    if suggestions:
+                        message = f'{len(suggestions)} probable address(es) found.'
+                    else:
+                        message = (
+                            location_service.last_warning
+                            or (
+                                'No suggestions found. You can keep the '
+                                'address and enter map coordinates manually.'
+                            )
+                        )
+                    address_status.set_text(message)
+
+                address_input.on_value_change(address_changed)
+
+                with ui.grid(columns=3).classes(
+                    'w-full gap-4 mt-3 max-[760px]:grid-cols-1'
+                ):
+                    city_input = ui.input(
+                        'City',
+                        value=str(draft.get('city') or ''),
+                    ).props('outlined')
+                    state_input = ui.input(
+                        'State',
+                        value=str(draft.get('state') or ''),
+                    ).props('outlined')
+                    pincode_input = ui.input(
+                        'PIN code',
+                        value=str(draft.get('pincode') or ''),
+                    ).props('outlined mask=######')
+
+                with ui.grid(columns=2).classes(
+                    'w-full gap-4 mt-3 max-[760px]:grid-cols-1'
+                ):
+                    sqft_input = ui.number(
+                        'Square footage *',
+                        value=int(draft.get('sqft') or 0),
+                        min=1,
+                        step=10,
+                    ).props('outlined')
+                    frontage_input = ui.input(
+                        'Frontage',
+                        value=str(
+                            (draft.get('optional') or {}).get(
+                                'Frontage',
+                                '',
+                            )
+                        ),
+                        placeholder='Example: 22 ft.',
+                    ).props('outlined')
+                    floor_input = ui.input(
+                        'Floor',
+                        value=str(
+                            (draft.get('optional') or {}).get('Floor', '')
+                        ),
+                        placeholder='Example: Ground floor',
+                    ).props('outlined')
+                    parking_input = ui.input(
+                        'Parking / access',
+                        value=str(
+                            (draft.get('optional') or {}).get('Parking', '')
+                        ),
+                        placeholder='Example: Mall parking available',
+                    ).props('outlined')
+
+                notes_input = ui.textarea(
+                    'Location notes and unstructured information',
+                    value=str(draft.get('notes') or ''),
+                    placeholder=(
+                        'Add broker comments, trade-area observations, lease '
+                        'terms, access constraints, nearby offices, competitor '
+                        'notes or anything else the ground team collected.'
+                    ),
+                ).props('outlined autogrow').classes('w-full mt-3')
+
+                with ui.expansion(
+                    'Map coordinates and address confirmation',
+                    icon='map',
+                ).classes('w-full mt-3'):
+                    ui.label(
+                        'Coordinates are filled automatically when the address '
+                        'provider returns them. Enter them manually when the '
+                        'provider account does not include coordinate access.',
+                    ).classes('text-xs muted')
+                    with ui.grid(columns=2).classes(
+                        'w-full gap-4 mt-3 max-[650px]:grid-cols-1'
+                    ):
+                        latitude_input = ui.number(
+                            'Latitude *',
+                            value=draft.get('lat'),
+                            min=6.0,
+                            max=38.0,
+                            step=0.000001,
+                            format='%.6f',
+                        ).props('outlined')
+                        longitude_input = ui.number(
+                            'Longitude *',
+                            value=draft.get('lng'),
+                            min=68.0,
+                            max=98.0,
+                            step=0.000001,
+                            format='%.6f',
+                        ).props('outlined')
+
+                ui.separator().classes('my-5')
+                with ui.row().classes(
+                    'w-full items-start justify-between gap-3'
+                ):
+                    with ui.column().classes('gap-0'):
+                        ui.label('Supporting documents').classes(
+                            'text-lg font-bold'
+                        )
+                        ui.label(
+                            'Optional · PDF, DOC, DOCX or TXT · up to 8 files · '
+                            '10 MB each · 25 MB total',
+                        ).classes('text-xs muted')
+                    ui.badge(
+                        'ANALYZED ONLY WHEN YOU CLICK ANALYZE',
+                        color='primary',
+                    ).props('outline')
+
+                @ui.refreshable
+                def document_list() -> None:
+                    documents = draft.get('documents') or []
+                    if not documents:
+                        with ui.row().classes(
+                            'w-full items-center gap-2 p-4 mt-3 rounded-xl '
+                            'border border-dashed border-[#d9cbd1]'
+                        ):
+                            ui.icon('upload_file').classes('text-primary')
+                            ui.label('No documents attached.').classes(
+                                'text-sm muted'
+                            )
+                        return
+
+                    with ui.column().classes('w-full gap-2 mt-3'):
+                        for document in list(documents):
+                            document_id = str(document.get('id') or '')
+
+                            def remove_document(
+                                doc_id: str = document_id,
+                            ) -> None:
+                                draft['documents'] = [
+                                    item
+                                    for item in draft.get('documents', [])
+                                    if str(item.get('id') or '') != doc_id
+                                ]
+                                document_list.refresh()
+
+                            with ui.row().classes(
+                                'document-row w-full items-center '
+                                'justify-between gap-3 p-3 no-wrap'
+                            ):
+                                with ui.row().classes(
+                                    'items-center gap-3 no-wrap min-w-0'
+                                ):
+                                    ui.icon('description').classes(
+                                        'text-primary shrink-0'
+                                    )
+                                    with ui.column().classes('gap-0 min-w-0'):
+                                        ui.label(
+                                            str(document.get('name') or 'Document')
+                                        ).classes(
+                                            'text-sm font-bold truncate'
+                                        )
+                                        source = (
+                                            'Preloaded demo metadata'
+                                            if document.get('source') == 'demo'
+                                            else _format_bytes(
+                                                int(
+                                                    document.get('size_bytes')
+                                                    or 0
+                                                )
+                                            )
+                                        )
+                                        ui.label(source).classes(
+                                            'text-[10px] muted'
+                                        )
+                                ui.button(
+                                    icon='delete_outline',
+                                    on_click=remove_document,
+                                ).props(
+                                    'flat round dense color=negative'
+                                )
+
+                document_list()
+
+                async def upload_document(event: Any) -> None:
+                    try:
+                        upload_file = event.file
+                        name = str(upload_file.name or '').strip()
+                        content_type = str(
+                            upload_file.content_type
+                            or 'application/octet-stream'
+                        )
+                        content = await upload_file.read()
+                        validate_document(
+                            name=name,
+                            size_bytes=len(content),
+                        )
+                        # Re-uploading the same filename replaces the previous
+                        # uploaded copy but does not silently remove a demo file.
+                        prospective_documents = [
+                            document
+                            for document in draft.get('documents', [])
+                            if not (
+                                document.get('source') == 'upload'
+                                and document.get('name') == name
+                            )
+                        ]
+                        if len(prospective_documents) >= MAX_DOCUMENTS:
+                            raise OutletDocumentAnalysisError(
+                                f'Only {MAX_DOCUMENTS} documents can be attached.'
+                            )
+                        current_actual_bytes = sum(
+                            int(document.get('size_bytes') or 0)
+                            for document in prospective_documents
+                            if document.get('source') == 'upload'
+                        )
+                        if current_actual_bytes + len(content) > MAX_TOTAL_BYTES:
+                            raise OutletDocumentAnalysisError(
+                                'Uploaded files exceed the 25 MB total limit.'
+                            )
+                        draft['documents'] = prospective_documents
+                        draft['documents'].append(
+                            {
+                                'id': f'doc-{uuid.uuid4().hex[:12]}',
+                                'name': name,
+                                'content_type': content_type,
+                                'size_bytes': len(content),
+                                'content': content,
+                                'source': 'upload',
+                                'mock_extract': '',
+                                'analysis_status': 'Ready for analysis',
+                            }
+                        )
+                        document_list.refresh()
+                        ui.notify(
+                            f'{name} attached.',
+                            type='positive',
+                        )
+                    except OutletDocumentAnalysisError as exc:
+                        ui.notify(str(exc), type='negative')
+                    except Exception as exc:
+                        ui.notify(
+                            f'Could not read uploaded file: {str(exc)[:180]}',
+                            type='negative',
+                        )
+
+                ui.upload(
+                    label='Choose supporting documents',
+                    multiple=True,
+                    auto_upload=True,
+                    max_file_size=MAX_FILE_BYTES,
+                    max_total_size=MAX_TOTAL_BYTES,
+                    max_files=MAX_DOCUMENTS,
+                    on_upload=upload_document,
+                    on_rejected=lambda _event: ui.notify(
+                        'A file was rejected. Check type, size and file count.',
+                        type='warning',
+                    ),
+                ).props(
+                    'accept=.pdf,.doc,.docx,.txt color=primary flat bordered'
+                ).classes('w-full mt-3')
+                ui.label(
+                    'When the Vesper RAG Engine is enabled, clicking Analyze '
+                    'sends the attached file contents and typed site notes to '
+                    'the configured document-intelligence service. If the '
+                    'Vesper RAG Engine is unavailable, Vesper uses its '
+                    'transparent local fallback.',
+                ).classes('text-[10px] muted leading-relaxed mt-2')
+
+                async def save_candidate() -> None:
+                    name = str(name_input.value or '').strip()
+                    address = str(address_input.value or '').strip()
+                    try:
+                        rent = float(rent_input.value or 0)
+                        sqft = int(float(sqft_input.value or 0))
+                    except (TypeError, ValueError):
+                        ui.notify(
+                            'Rent and square footage must be valid numbers.',
+                            type='negative',
+                        )
+                        return
+
+                    if not address:
+                        ui.notify('Full address is required.', type='negative')
+                        return
+                    if rent <= 0:
+                        ui.notify('Monthly rent must be greater than zero.', type='negative')
+                        return
+                    if sqft <= 0:
+                        ui.notify('Square footage must be greater than zero.', type='negative')
+                        return
+
+                    lat = latitude_input.value
+                    lng = longitude_input.value
+                    if lat in (None, '') or lng in (None, ''):
+                        address_status.set_text(
+                            'Resolving map coordinates before saving…'
+                        )
+                        resolved = await location_service.geocode(address)
+                        if resolved is not None and resolved.has_coordinates:
+                            lat = resolved.latitude
+                            lng = resolved.longitude
+                            latitude_input.set_value(lat)
+                            longitude_input.set_value(lng)
+                            if not city_input.value:
+                                city_input.set_value(resolved.city)
+                            if not state_input.value:
+                                state_input.set_value(resolved.state)
+                            if not pincode_input.value:
+                                pincode_input.set_value(
+                                    resolved.postal_code
+                                )
+                            draft['address_provider'] = resolved.provider
+                            draft['provider_place_id'] = resolved.provider_id
+                            draft['address_confirmed'] = True
+
+                    try:
+                        lat_float = float(lat)
+                        lng_float = float(lng)
+                    except (TypeError, ValueError):
+                        ui.notify(
+                            'A map point is required. Select an address '
+                            'suggestion or enter latitude and longitude.',
+                            type='negative',
+                        )
+                        return
+                    if not (6.0 <= lat_float <= 38.0 and 68.0 <= lng_float <= 98.0):
+                        ui.notify(
+                            'Coordinates must fall within the supported India '
+                            'demo bounds.',
+                            type='negative',
+                        )
+                        return
+
+                    if not name:
+                        name = (
+                            str(city_input.value or '').strip()
+                            or address.split(',', maxsplit=1)[0].strip()
+                            or 'New shortlisted location'
+                        )[:80]
+
+                    draft.update(
+                        {
+                            'id': working_id,
+                            'name': name,
+                            'address': address,
+                            'rent': round(rent, 2),
+                            'sqft': sqft,
+                            'city': str(city_input.value or '').strip(),
+                            'state': str(state_input.value or '').strip(),
+                            'pincode': str(pincode_input.value or '').strip(),
+                            'lat': lat_float,
+                            'lng': lng_float,
+                            'notes': str(notes_input.value or '').strip(),
+                            'optional': {
+                                'Frontage': str(
+                                    frontage_input.value or ''
+                                ).strip(),
+                                'Floor': str(floor_input.value or '').strip(),
+                                'Parking': str(
+                                    parking_input.value or ''
+                                ).strip(),
+                            },
+                        }
+                    )
+
+                    material_fields = (
+                        'address',
+                        'rent',
+                        'sqft',
+                        'notes',
+                        'optional',
+                        'documents',
+                    )
+                    materially_changed = is_new or any(
+                        draft.get(field) != original.get(field)
+                        for field in material_fields
+                    )
+                    if materially_changed:
+                        draft['document_analysis'] = None
+                        draft['analysis_mode'] = 'none'
+                        draft['analysis_status'] = (
+                            'Saved · run Analyze for document review'
+                        )
+
+                    calculate_location_analysis(draft, candidates)
+                    if materially_changed:
+                        draft['analysis_status'] = (
+                            'Preliminary · document analysis pending'
+                        )
+
+                    candidates[working_id] = draft
+                    page_state['selected'] = working_id
+                    persist_state()
+                    candidate_list.refresh()
+                    update_candidate_count()
+                    dialog.close()
+                    await rebuild_markers(
+                        focus_candidate_id=working_id
+                    )
+                    refs['analysis'].clear()
+                    render_details(working_id)
+                    ui.notify(
+                        f'{name} saved. Click Analyze to review its '
+                        'documents and refresh the final verdict.',
+                        type='positive',
+                    )
+
+                with ui.row().classes(
+                    'w-full justify-end gap-2 mt-6 flex-wrap'
+                ):
+                    ui.button(
+                        'Cancel',
+                        on_click=dialog.close,
+                    ).props('flat no-caps')
+                    ui.button(
+                        'Save candidate',
+                        icon='save',
+                        on_click=save_candidate,
+                    ).props('unelevated no-caps').classes('rounded-xl')
+
+        dialog.open()
+
+    def request_delete(candidate_id: str) -> None:
+        candidate = candidates.get(candidate_id)
+        if candidate is None:
+            return
+
+        with ui.dialog() as dialog:
+            with ui.card().classes(
+                'w-[520px] max-w-[94vw] p-6 rounded-2xl'
+            ):
+                ui.label('Delete shortlisted location?').classes(
+                    'text-xl font-bold'
+                )
+                ui.label(
+                    f"{candidate['name']} and its map point will be removed "
+                    'from this demo tab.',
+                ).classes('text-sm muted mt-2')
+                ui.label(
+                    'Restarting the server or using Reset restores the '
+                    'original four candidates.',
+                ).classes('text-xs muted mt-2')
+
+                async def confirm_delete() -> None:
+                    candidates.pop(candidate_id, None)
+                    decisions.pop(candidate_id, None)
+                    if page_state['selected'] == candidate_id:
+                        page_state['selected'] = None
+                        refs['details'].clear()
+                        refs['analysis'].clear()
+                    persist_state()
+                    candidate_list.refresh()
+                    update_candidate_count()
+                    dialog.close()
+                    await rebuild_markers()
+                    ui.notify(
+                        f"{candidate['name']} deleted.",
+                        type='positive',
+                    )
+
+                with ui.row().classes('w-full justify-end gap-2 mt-5'):
+                    ui.button(
+                        'Cancel',
+                        on_click=dialog.close,
+                    ).props('flat no-caps')
+                    ui.button(
+                        'Delete',
+                        icon='delete',
+                        on_click=confirm_delete,
+                    ).props(
+                        'unelevated no-caps color=negative'
+                    )
+        dialog.open()
+
+    def request_reset() -> None:
+        with ui.dialog() as dialog:
+            with ui.card().classes(
+                'w-[520px] max-w-[94vw] p-6 rounded-2xl'
+            ):
+                ui.label('Reset Outlet Intelligence?').classes(
+                    'text-xl font-bold'
+                )
+                ui.label(
+                    'All added candidates, edits, uploaded files, deletions '
+                    'and workflow decisions in this browser tab will be '
+                    'discarded.',
+                ).classes('text-sm muted mt-2')
+
+                async def confirm_reset() -> None:
+                    candidates.clear()
+                    candidates.update(clone_default_candidates())
+                    decisions.clear()
+                    page_state['selected'] = None
+                    page_state['analysis_run'] += 1
+                    persist_state()
+                    candidate_list.refresh()
+                    update_candidate_count()
+                    refs['details'].clear()
+                    refs['analysis'].clear()
+                    dialog.close()
+                    await rebuild_markers()
+                    ui.notify(
+                        'Outlet Intelligence restored to its original demo state.',
+                        type='positive',
+                    )
+
+                with ui.row().classes('w-full justify-end gap-2 mt-5'):
+                    ui.button(
+                        'Cancel',
+                        on_click=dialog.close,
+                    ).props('flat no-caps')
+                    ui.button(
+                        'Reset',
+                        icon='restart_alt',
+                        on_click=confirm_reset,
+                    ).props('unelevated no-caps color=negative')
+        dialog.open()
+
+    @ui.refreshable
+    def candidate_list() -> None:
+        with ui.column().classes(
+            'w-full gap-3 max-h-[500px] overflow-auto pr-1'
+        ):
+            if not candidates:
+                with ui.card().classes(
+                    'candidate-row w-full p-5 shadow-none'
+                ):
+                    ui.icon('add_location_alt').classes(
+                        'text-3xl text-primary'
+                    )
+                    ui.label('No candidates in the shortlist.').classes(
+                        'text-sm font-bold mt-2'
+                    )
+                    ui.label(
+                        'Use Add entry to create the first location and map point.'
+                    ).classes('text-xs muted')
+                return
+
+            for candidate_id, candidate in candidates.items():
+                with ui.card().classes(
+                    'candidate-row w-full p-3 shadow-none'
+                ):
+                    with ui.row().classes(
+                        'w-full items-start justify-between gap-2 no-wrap'
+                    ):
+                        with ui.column().classes('gap-0 min-w-0'):
+                            ui.label(candidate['name']).classes(
+                                'text-sm font-bold truncate'
+                            )
+                            ui.label(
+                                f"{_format_lakh(float(candidate['rent']))}/month "
+                                f"· {int(candidate['sqft']):,} sq. ft."
+                            ).classes('text-[11px] muted')
+                            ui.label(
+                                str(candidate.get('analysis_status') or '')
+                            ).classes('text-[10px] muted mt-1')
+                        _status(str(candidate.get('status') or 'Review'))
+
+                    with ui.row().classes(
+                        'w-full items-center gap-1 mt-2 flex-wrap'
+                    ):
+                        ui.button(
+                            'Analyze',
+                            icon='auto_awesome',
+                            on_click=lambda cid=candidate_id: analyze(cid),
+                        ).props(
+                            'flat dense no-caps color=primary'
+                        ).classes('text-xs')
+                        ui.button(
+                            'Edit',
+                            icon='edit',
+                            on_click=lambda cid=candidate_id: (
+                                open_candidate_editor(cid)
+                            ),
+                        ).props(
+                            'flat dense no-caps color=primary'
+                        ).classes('text-xs')
+                        ui.space()
+                        ui.button(
+                            'Delete',
+                            icon='delete_outline',
+                            on_click=lambda cid=candidate_id: (
+                                request_delete(cid)
+                            ),
+                        ).props(
+                            'flat dense no-caps color=negative'
+                        ).classes('text-xs')
 
     with ui.dialog() as source_dialog:
         refs['source_dialog'] = source_dialog
-        with ui.card().classes('w-[650px] max-w-[94vw] p-6 rounded-2xl'):
+        with ui.card().classes(
+            'w-[650px] max-w-[94vw] p-6 rounded-2xl'
+        ):
             refs['source_content'] = ui.column().classes('w-full gap-1')
             with ui.row().classes('w-full justify-end mt-3'):
-                ui.button('Close', on_click=source_dialog.close).props('flat no-caps')
+                ui.button(
+                    'Close',
+                    on_click=source_dialog.close,
+                ).props('flat no-caps')
 
-    with ui.column().classes('w-full max-w-[1540px] mx-auto px-4 md:px-7 py-6 gap-5'):
-        with ui.row().classes('w-full items-start justify-between'):
+    with ui.column().classes(
+        'w-full max-w-[1540px] mx-auto px-4 md:px-7 py-6 gap-5'
+    ):
+        with ui.row().classes(
+            'w-full items-start justify-between gap-3 flex-wrap'
+        ):
             with ui.column().classes('gap-1'):
                 ui.label('OUTLET INTELLIGENCE').classes('section-kicker')
-                ui.label('AI-assisted location investment studio').classes('text-2xl md:text-3xl font-extrabold')
-                ui.label('Shortlisted properties enriched with location, competition and financial intelligence').classes('text-sm muted')
-            ui.badge(f'{len(CANDIDATES)} MOCK CANDIDATES', color='positive').props('outline')
+                ui.label('AI-assisted location investment studio').classes(
+                    'text-2xl md:text-3xl font-extrabold'
+                )
+                ui.label(
+                    'Create, edit and analyze shortlisted properties using '
+                    'structured inputs, uploaded documents and location intelligence.',
+                ).classes('text-sm muted')
+            with ui.row().classes('items-center gap-2 flex-wrap'):
+                refs['candidate_count'] = ui.badge(
+                    f'{len(candidates)} CANDIDATES',
+                    color='positive',
+                ).props('outline')
+                ui.button(
+                    'Reset',
+                    icon='restart_alt',
+                    on_click=request_reset,
+                ).props('outline no-caps').classes('rounded-xl')
+                ui.button(
+                    'Add entry',
+                    icon='add_location_alt',
+                    on_click=lambda: open_candidate_editor(),
+                ).props('unelevated no-caps').classes('rounded-xl')
 
-        with ui.grid(columns=12).classes('w-full gap-4 max-[1050px]:grid-cols-1'):
-            with ui.card().classes('surface col-span-8 p-5 w-full max-[1050px]:col-span-1'):
-                with ui.row().classes('w-full items-start justify-between'):
+        with ui.grid(columns=12).classes(
+            'w-full gap-4 max-[1050px]:grid-cols-1'
+        ):
+            with ui.card().classes(
+                'surface col-span-8 p-5 w-full max-[1050px]:col-span-1'
+            ):
+                with ui.row().classes(
+                    'w-full items-start justify-between gap-3'
+                ):
                     with ui.column().classes('gap-0'):
-                        ui.label('India candidate map').classes('text-lg font-bold')
-                        ui.label('Click a dot to run the mock AI evaluation').classes('text-xs muted')
-                    with ui.row().classes('gap-2'):
+                        ui.label('India candidate map').classes(
+                            'text-lg font-bold'
+                        )
+                        ui.label(
+                            'Each saved entry has a map point. Click a dot to '
+                            'run its latest analysis.',
+                        ).classes('text-xs muted')
+                    with ui.row().classes('gap-2 flex-wrap'):
                         for label, color in STATUS_COLORS.items():
                             with ui.row().classes('items-center gap-1'):
-                                ui.element('span').style(f'width:9px;height:9px;border-radius:50%;background:{color};display:inline-block;')
+                                ui.element('span').style(
+                                    'width:9px;height:9px;border-radius:50%;'
+                                    f'background:{color};display:inline-block;'
+                                )
                                 ui.label(label).classes('text-[10px] muted')
 
                 candidate_map = ui.leaflet(
                     center=(22.7, 79.4),
                     zoom=5,
-                    options={'scrollWheelZoom': True, 'zoomControl': True},
+                    options={
+                        'scrollWheelZoom': True,
+                        'zoomControl': True,
+                    },
                 ).classes('location-map w-full h-[540px] mt-4')
 
-                for candidate_id, c in CANDIDATES.items():
-                    marker_layers[candidate_id] = candidate_map.generic_layer(
-                        name='circleMarker',
-                        args=[
-                            [c['lat'], c['lng']],
-                            {
-                                'radius': 10,
-                                'color': '#FFFFFF',
-                                'weight': 3,
-                                'fillColor': STATUS_COLORS[c['status']],
-                                'fillOpacity': 1.0,
-                            },
-                        ],
-                    )
-
-            with ui.card().classes('surface col-span-4 p-5 w-full max-[1050px]:col-span-1'):
-                ui.label('Shortlisted candidates').classes('text-lg font-bold')
-                ui.label('Minimum inputs: address, rent and square footage').classes('text-xs muted')
-                with ui.column().classes('w-full gap-3 mt-4 max-h-[500px] overflow-auto pr-1'):
-                    for candidate_id, c in CANDIDATES.items():
-                        with ui.card().classes('candidate-row w-full p-3 shadow-none'):
-                            with ui.row().classes('w-full items-start justify-between gap-2'):
-                                with ui.column().classes('gap-0'):
-                                    ui.label(c['name']).classes('text-sm font-bold')
-                                    ui.label(f"{_format_lakh(c['rent'])}/month · {c['sqft']} sq. ft.").classes('text-[11px] muted')
-                                _status(c['status'])
-                            ui.button('Analyze', icon='auto_awesome', on_click=lambda cid=candidate_id: analyze(cid)).props('flat dense no-caps color=primary').classes('text-xs mt-2')
+            with ui.card().classes(
+                'surface col-span-4 p-5 w-full max-[1050px]:col-span-1'
+            ):
+                with ui.row().classes(
+                    'w-full items-start justify-between gap-3'
+                ):
+                    with ui.column().classes('gap-0'):
+                        ui.label('Shortlisted candidates').classes(
+                            'text-lg font-bold'
+                        )
+                        ui.label(
+                            'Required: address, rent, square footage and map point'
+                        ).classes('text-xs muted')
+                    ui.button(
+                        icon='add',
+                        on_click=lambda: open_candidate_editor(),
+                    ).props('flat round dense color=primary')
+                candidate_list()
 
         refs['analysis'] = ui.column().classes('w-full')
         refs['details'] = ui.column().classes('w-full')
-        ui.label('Prototype only · All location, financial and source values are simulated.').classes('text-[11px] muted')
+        ui.label(
+            'Prototype only · Uploaded files are held in per-tab server memory '
+            'and disappear when the demo server restarts. Location-market '
+            'signals and financial outputs are simulated.',
+        ).classes('text-[11px] muted')
 
-    ui.on('candidate-selected', marker_event)
-    await candidate_map.initialized()
-    for candidate_id, layer in marker_layers.items():
-        c = CANDIDATES[candidate_id]
-        candidate_map.run_layer_method(layer.id, 'bindTooltip', f"{c['name']} · {c['status']}")
-        candidate_map.run_layer_method(
-            layer.id,
-            ':on',
-            '"click"',
-            f'function() {{ emitEvent("candidate-selected", {{candidate_id: "{candidate_id}"}}); }}',
-        )
+    ui.on(map_event_name, marker_event)
+    await rebuild_markers()
+
+    selected = page_state.get('selected')
+    if selected in candidates:
+        render_details(str(selected))
