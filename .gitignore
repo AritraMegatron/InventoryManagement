@@ -8,6 +8,9 @@
 venv/
 env/
 
+#demo material
+Vesper_New_Location_Demo_Pack/
+
 # Python cache
 __pycache__/
 *.py[cod]

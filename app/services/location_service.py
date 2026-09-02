@@ -369,7 +369,7 @@ class MapplsLocationService:
         return await self.resolve(result)
 
 
-DEMO_LOCATIONS: tuple[LocationSuggestion, ...] = (
+INDIA_DEMO_LOCATIONS: tuple[LocationSuggestion, ...] = (
     LocationSuggestion(
         'DEMO-NOIDA-62', 'Sector 62, Noida',
         'Electronic City Metro corridor, Sector 62, Noida, Uttar Pradesh 201309',
@@ -433,6 +433,124 @@ DEMO_LOCATIONS: tuple[LocationSuggestion, ...] = (
 )
 
 
+CANADA_DEMO_LOCATIONS: tuple[LocationSuggestion, ...] = (
+    LocationSuggestion(
+        'DEMO-CA-TOR-EATON', 'Yonge & Dundas, Toronto',
+        '220 Yonge Street, Toronto, Ontario M5B 2H1, Canada',
+        'Toronto', 'Ontario', 'M5B 2H1', 43.6544, -79.3807,
+        provider='demo-ca',
+    ),
+    LocationSuggestion(
+        'DEMO-CA-VAN-PACIFIC', 'Pacific Centre, Vancouver',
+        '701 West Georgia Street, Vancouver, British Columbia V7Y 1G5, Canada',
+        'Vancouver', 'British Columbia', 'V7Y 1G5', 49.2832, -123.1171,
+        provider='demo-ca',
+    ),
+    LocationSuggestion(
+        'DEMO-CA-MTL-EATON', 'Sainte-Catherine, Montréal',
+        '705 Rue Sainte-Catherine Ouest, Montréal, Québec H3B 4G5, Canada',
+        'Montréal', 'Québec', 'H3B 4G5', 45.5037, -73.5710,
+        provider='demo-ca',
+    ),
+    LocationSuggestion(
+        'DEMO-CA-CGY-CHINOOK', 'Chinook Centre, Calgary',
+        '6455 Macleod Trail SW, Calgary, Alberta T2H 0K8, Canada',
+        'Calgary', 'Alberta', 'T2H 0K8', 50.9985, -114.0744,
+        provider='demo-ca',
+    ),
+    LocationSuggestion(
+        'DEMO-CA-OTT-RIDEAU', 'Rideau Centre, Ottawa',
+        '50 Rideau Street, Ottawa, Ontario K1N 9J7, Canada',
+        'Ottawa', 'Ontario', 'K1N 9J7', 45.4251, -75.6900,
+        provider='demo-ca',
+    ),
+    LocationSuggestion(
+        'DEMO-CA-MIS-SQ1', 'Square One, Mississauga',
+        '100 City Centre Drive, Mississauga, Ontario L5B 2C9, Canada',
+        'Mississauga', 'Ontario', 'L5B 2C9', 43.5930, -79.6425,
+        provider='demo-ca',
+    ),
+    LocationSuggestion(
+        'DEMO-CA-EDM-WEM', 'West Edmonton Mall',
+        '8882 170 Street NW, Edmonton, Alberta T5T 4J2, Canada',
+        'Edmonton', 'Alberta', 'T5T 4J2', 53.5225, -113.6242,
+        provider='demo-ca',
+    ),
+    LocationSuggestion(
+        'DEMO-CA-HFX-SHOPPING', 'Halifax Shopping Centre',
+        '7001 Mumford Road, Halifax, Nova Scotia B3L 4N9, Canada',
+        'Halifax', 'Nova Scotia', 'B3L 4N9', 44.6494, -63.6189,
+        provider='demo-ca',
+    ),
+    LocationSuggestion(
+        'DEMO-CA-TOR-THE-WELL',
+        'The Well, Toronto',
+        '486 Front Street West, Toronto, Ontario M5V 0V2, Canada',
+        'Toronto',
+        'Ontario',
+        'M5V 0V2',
+        43.6427,
+        -79.3948,
+        provider='demo-ca',
+    ),
+)
+
+
+class DemoCanadianLocationService:
+    """Offline Canadian address catalog for deterministic client demos."""
+
+    @property
+    def provider_label(self) -> str:
+        return 'Built-in Canadian demo addresses'
+
+    @property
+    def is_live(self) -> bool:
+        return False
+
+    async def suggest(
+        self,
+        query: str,
+        *,
+        proximity: tuple[float, float] | None = None,
+        limit: int = 6,
+    ) -> list[LocationSuggestion]:
+        del proximity
+        words = [word for word in query.lower().split() if word]
+        if len(''.join(words)) < 3:
+            return []
+
+        ranked: list[tuple[int, LocationSuggestion]] = []
+        for suggestion in CANADA_DEMO_LOCATIONS:
+            text = suggestion.searchable_text
+            matches = sum(word in text for word in words)
+            if matches:
+                exact_bonus = 5 if query.lower() in text else 0
+                ranked.append((matches * 10 + exact_bonus, suggestion))
+        ranked.sort(key=lambda item: (-item[0], item[1].display_name))
+        return [item[1] for item in ranked[:max(1, limit)]]
+
+    async def resolve(
+        self,
+        suggestion: LocationSuggestion,
+    ) -> LocationSuggestion:
+        return suggestion
+
+    async def geocode(self, address: str) -> LocationSuggestion | None:
+        query = address.lower().strip()
+        if not query:
+            return None
+        best: tuple[int, LocationSuggestion] | None = None
+        words = [word for word in query.split() if len(word) >= 3]
+        for suggestion in CANADA_DEMO_LOCATIONS:
+            text = suggestion.searchable_text
+            score = sum(word in text for word in words)
+            if query in text:
+                score += 10
+            if best is None or score > best[0]:
+                best = (score, suggestion)
+        return best[1] if best and best[0] >= 2 else None
+
+
 class DemoIndianLocationService:
     """Offline fallback so the demo remains usable without an API key."""
 
@@ -457,7 +575,7 @@ class DemoIndianLocationService:
             return []
 
         ranked: list[tuple[int, LocationSuggestion]] = []
-        for suggestion in DEMO_LOCATIONS:
+        for suggestion in INDIA_DEMO_LOCATIONS:
             text = suggestion.searchable_text
             matches = sum(word in text for word in words)
             if matches:
@@ -478,7 +596,7 @@ class DemoIndianLocationService:
             return None
         best: tuple[int, LocationSuggestion] | None = None
         words = [word for word in query.split() if len(word) >= 3]
-        for suggestion in DEMO_LOCATIONS:
+        for suggestion in INDIA_DEMO_LOCATIONS:
             text = suggestion.searchable_text
             score = sum(word in text for word in words)
             if query in text:
@@ -494,7 +612,7 @@ class HybridLocationService:
     def __init__(
         self,
         live_service: MapplsLocationService | None,
-        demo_service: DemoIndianLocationService,
+        demo_service: LocationService,
     ) -> None:
         self._live = live_service
         self._demo = demo_service
@@ -598,7 +716,20 @@ class HybridLocationService:
         return await self._demo.geocode(address)
 
 
-def create_location_service() -> HybridLocationService:
+def create_location_service(
+    profile: dict[str, Any] | None = None,
+) -> HybridLocationService:
+    """Create a country-appropriate address service for the active brand.
+
+    Mappls is intentionally used only for the India workspace. The Canadian
+    MVP uses a deterministic offline catalog until a Canada-capable production
+    provider (for example Google Places) is configured later.
+    """
+
+    country_code = str((profile or {}).get('country_code') or 'IN').upper()
+    if country_code == 'CA':
+        return HybridLocationService(None, DemoCanadianLocationService())
+
     key = (
         os.getenv('MAPPLS_REST_KEY')
         or os.getenv('MAPPLS_ACCESS_TOKEN')

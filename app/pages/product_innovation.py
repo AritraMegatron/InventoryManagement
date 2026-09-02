@@ -4,545 +4,27 @@ from __future__ import annotations
 import asyncio
 import csv
 import io
-import random
 from datetime import datetime
 from typing import Any
 
-from nicegui import events, ui
+from nicegui import app, events, ui
 
 from app.ai_chat import AIChatController, create_ai_chat
 from app.company_context import PAGE_CONTEXTS
+from app.data.product_innovation_catalog import SOURCE_CATALOG
+from app.session_ui import require_brand_login, render_brand_session_controls
+from app.services.currency_service import format_money
+from app.services.product_innovation_service import (
+    build_product_rows,
+    ensure_product_innovation_state,
+    get_pilot_plans,
+    get_product_concepts,
+    refresh_market_scan,
+    save_pilot_plan as persist_pilot_plan,
+)
+from app.state.demo_state import get_brand_state
 
 from app.theme import BURGUNDY, GOLD, GREEN, MUTED, RED, apply_theme
-
-
-SOURCE_CATALOG = {
-    'menus': {
-        'name': 'Competitor menu monitor',
-        'type': 'Public menu and visible product listings',
-        'freshness': 'Mock refresh: today',
-        'description': (
-            'Tracks visible product launches, pricing, category expansion, '
-            'and recurring menu formats across selected competitors.'
-        ),
-    },
-    'reviews': {
-        'name': 'Consumer review analysis',
-        'type': 'Public customer-language intelligence',
-        'freshness': 'Mock refresh: today',
-        'description': (
-            'Clusters recurring preferences, complaints, dietary requests, '
-            'and product attributes from public review text.'
-        ),
-    },
-    'search': {
-        'name': 'Search-interest monitor',
-        'type': 'Public directional demand signals',
-        'freshness': 'Mock refresh: this week',
-        'description': (
-            'Measures directional interest for product categories and '
-            'flavors across selected markets.'
-        ),
-    },
-    'social': {
-        'name': 'Social trend monitor',
-        'type': 'Public conversation intelligence',
-        'freshness': 'Mock refresh: today',
-        'description': (
-            'Identifies fast-growing visual formats, flavor combinations, '
-            'and customer vocabulary from public content.'
-        ),
-    },
-    'sales': {
-        'name': 'Internal product sales history',
-        'type': 'Internal business data',
-        'freshness': 'Current mock snapshot',
-        'description': (
-            'Measures sales of related products, geographic fit, repeat '
-            'purchase, and performance of previous launches.'
-        ),
-    },
-    'ingredients': {
-        'name': 'Recipe and ingredient master',
-        'type': 'Internal operational data',
-        'freshness': 'Current mock snapshot',
-        'description': (
-            'Estimates ingredient reuse, new sourcing requirements, '
-            'preparation complexity, and unit economics.'
-        ),
-    },
-}
-
-
-CONCEPTS: dict[str, dict[str, Any]] = {
-    'protein_chocolate': {
-        'name': 'High-Protein Chocolate Shake',
-        'category': 'Functional beverages',
-        'score': 89,
-        'momentum': 91,
-        'overlap': 82,
-        'margin': 66,
-        'complexity': 'Low',
-        'competition': 'Medium',
-        'confidence': 'High',
-        'verdict': 'Pilot',
-        'price': '₹339–₹369',
-        'markets': ['Bengaluru', 'Gurugram', 'Pune'],
-        'outlets': 6,
-        'weeks': 4,
-        'customer': (
-            'Urban customers aged 20–35 seeking indulgence with a '
-            'functional benefit.'
-        ),
-        'summary': (
-            'A premium chocolate shake with a clear protein proposition '
-            'and minimal change to the existing preparation workflow.'
-        ),
-        'ingredients': [
-            ('Chocolate base', 'Existing'),
-            ('Milk / dairy base', 'Existing'),
-            ('Protein blend', 'New'),
-            ('Low-sugar support', 'Minor adjustment'),
-        ],
-        'signals': [
-            {
-                'title': 'Functional beverage momentum',
-                'value': '+24% directional interest',
-                'impact': '+14 points',
-                'tone': 'positive',
-                'source': 'search',
-                'evidence': (
-                    'Protein drinks and functional shakes show sustained '
-                    'interest across premium urban markets in the mock scan.'
-                ),
-            },
-            {
-                'title': 'Competitor adoption',
-                'value': '14 tracked menu appearances',
-                'impact': '+10 points',
-                'tone': 'positive',
-                'source': 'menus',
-                'evidence': (
-                    'Protein-positioned beverages appear across a growing '
-                    'set of premium café and dessert menus.'
-                ),
-            },
-            {
-                'title': 'Internal flavor fit',
-                'value': 'Chocolate is a top-performing base',
-                'impact': '+12 points',
-                'tone': 'positive',
-                'source': 'sales',
-                'evidence': (
-                    'Existing chocolate products show strong revenue and '
-                    'repeat purchase in the mock internal dataset.'
-                ),
-            },
-            {
-                'title': 'Ingredient reuse',
-                'value': '82% existing ingredient overlap',
-                'impact': '+8 points',
-                'tone': 'positive',
-                'source': 'ingredients',
-                'evidence': (
-                    'Only the protein blend requires meaningful incremental '
-                    'sourcing in the mock recipe assessment.'
-                ),
-            },
-            {
-                'title': 'Cost sensitivity',
-                'value': 'Protein input raises unit cost',
-                'impact': '-5 points',
-                'tone': 'risk',
-                'source': 'ingredients',
-                'evidence': (
-                    'Premium pricing is required to preserve the target '
-                    'margin after adding the protein ingredient.'
-                ),
-            },
-        ],
-    },
-    'mini_shake_flight': {
-        'name': 'Mini Shake Flight',
-        'category': 'Format innovation',
-        'score': 86,
-        'momentum': 82,
-        'overlap': 96,
-        'margin': 69,
-        'complexity': 'Medium',
-        'competition': 'Low',
-        'confidence': 'High',
-        'verdict': 'Pilot',
-        'price': '₹449–₹499',
-        'markets': ['Delhi NCR', 'Mumbai', 'Bengaluru'],
-        'outlets': 10,
-        'weeks': 4,
-        'customer': (
-            'Groups and younger customers seeking variety and a '
-            'shareable product experience.'
-        ),
-        'summary': (
-            'A tasting format that repackages proven best sellers into '
-            'a shareable premium experience.'
-        ),
-        'ingredients': [
-            ('Chocolate shake base', 'Existing'),
-            ('Cold coffee base', 'Existing'),
-            ('Mango base', 'Existing'),
-            ('Mini serving cups', 'New packaging'),
-        ],
-        'signals': [
-            {
-                'title': 'Variety-seeking behavior',
-                'value': 'Strong customer-language cluster',
-                'impact': '+12 points',
-                'tone': 'positive',
-                'source': 'reviews',
-                'evidence': (
-                    'Customers frequently mention wanting to try several '
-                    'flavors without purchasing full portions.'
-                ),
-            },
-            {
-                'title': 'Ingredient reuse',
-                'value': '96% existing overlap',
-                'impact': '+14 points',
-                'tone': 'positive',
-                'source': 'ingredients',
-                'evidence': (
-                    'The concept primarily repackages existing recipes and '
-                    'requires only new serving packaging.'
-                ),
-            },
-            {
-                'title': 'Internal product fit',
-                'value': 'Uses three proven best sellers',
-                'impact': '+12 points',
-                'tone': 'positive',
-                'source': 'sales',
-                'evidence': (
-                    'The proposed flight uses products with strong historical '
-                    'performance in the mock internal dataset.'
-                ),
-            },
-            {
-                'title': 'Service-time risk',
-                'value': 'Multiple cups per order',
-                'impact': '-5 points',
-                'tone': 'risk',
-                'source': 'ingredients',
-                'evidence': (
-                    'Assembly may slow peak-period service unless the '
-                    'preparation process is standardized.'
-                ),
-            },
-        ],
-    },
-    'rose_falooda': {
-        'name': 'Rose Falooda Sundae',
-        'category': 'Regional indulgence',
-        'score': 84,
-        'momentum': 79,
-        'overlap': 74,
-        'margin': 64,
-        'complexity': 'Medium',
-        'competition': 'Medium',
-        'confidence': 'High',
-        'verdict': 'Pilot',
-        'price': '₹299–₹329',
-        'markets': ['Delhi NCR', 'Mumbai', 'Jaipur'],
-        'outlets': 8,
-        'weeks': 5,
-        'customer': (
-            'Families and young consumers seeking familiar regional '
-            'flavors in a modern presentation.'
-        ),
-        'summary': (
-            'A visually distinctive sundae combining a familiar Indian '
-            'dessert format with premium presentation.'
-        ),
-        'ingredients': [
-            ('Vanilla ice cream', 'Existing'),
-            ('Rose syrup', 'New'),
-            ('Falooda sev', 'New'),
-            ('Basil seeds', 'New'),
-            ('Nut garnish', 'Existing'),
-        ],
-        'signals': [
-            {
-                'title': 'Regional flavor interest',
-                'value': '+18% review-language growth',
-                'impact': '+11 points',
-                'tone': 'positive',
-                'source': 'reviews',
-                'evidence': (
-                    'Regional dessert flavors appear more frequently in '
-                    'positive customer-language clusters.'
-                ),
-            },
-            {
-                'title': 'Visual social potential',
-                'value': 'High shareable-format score',
-                'impact': '+8 points',
-                'tone': 'positive',
-                'source': 'social',
-                'evidence': (
-                    'Layered desserts with strong color and texture perform '
-                    'well in the mock public-content scan.'
-                ),
-            },
-            {
-                'title': 'Brand fit',
-                'value': 'Strong heritage compatibility',
-                'impact': '+13 points',
-                'tone': 'positive',
-                'source': 'sales',
-                'evidence': (
-                    'The concept remains close to the brand’s indulgent '
-                    'beverage and dessert positioning.'
-                ),
-            },
-            {
-                'title': 'Preparation complexity',
-                'value': 'Three incremental components',
-                'impact': '-7 points',
-                'tone': 'risk',
-                'source': 'ingredients',
-                'evidence': (
-                    'Falooda sev, soaked seeds, and layered assembly increase '
-                    'preparation and holding complexity.'
-                ),
-            },
-        ],
-    },
-    'low_sugar_mango': {
-        'name': 'Low-Sugar Alphonso Shake',
-        'category': 'Better-for-you',
-        'score': 81,
-        'momentum': 85,
-        'overlap': 88,
-        'margin': 63,
-        'complexity': 'Low',
-        'competition': 'Medium',
-        'confidence': 'High',
-        'verdict': 'Pilot',
-        'price': '₹299–₹329',
-        'markets': ['Mumbai', 'Pune', 'Bengaluru'],
-        'outlets': 8,
-        'weeks': 5,
-        'customer': (
-            'Existing shake customers seeking a lower-sugar alternative '
-            'without abandoning indulgence.'
-        ),
-        'summary': (
-            'A familiar seasonal product adjusted for consumers seeking '
-            'less sugar and a lighter sweetness profile.'
-        ),
-        'ingredients': [
-            ('Alphonso mango pulp', 'Existing'),
-            ('Milk base', 'Existing'),
-            ('Reduced-sugar support', 'Minor adjustment'),
-            ('Sweetness balancing', 'Minor adjustment'),
-        ],
-        'signals': [
-            {
-                'title': 'Lower-sugar demand',
-                'value': '+21% request-language growth',
-                'impact': '+12 points',
-                'tone': 'positive',
-                'source': 'reviews',
-                'evidence': (
-                    'Requests for lower-sugar and less-sweet options appear '
-                    'more frequently across the mock review scan.'
-                ),
-            },
-            {
-                'title': 'Existing seasonal strength',
-                'value': 'Mango is a proven seasonal seller',
-                'impact': '+11 points',
-                'tone': 'positive',
-                'source': 'sales',
-                'evidence': (
-                    'Mango products perform strongly during warm-season '
-                    'periods in the mock internal history.'
-                ),
-            },
-            {
-                'title': 'Ingredient reuse',
-                'value': '88% existing overlap',
-                'impact': '+9 points',
-                'tone': 'positive',
-                'source': 'ingredients',
-                'evidence': (
-                    'The concept needs recipe tuning rather than a new '
-                    'ingredient and equipment ecosystem.'
-                ),
-            },
-            {
-                'title': 'Taste expectation risk',
-                'value': 'Requires sensory validation',
-                'impact': '-6 points',
-                'tone': 'risk',
-                'source': 'reviews',
-                'evidence': (
-                    'Customers may reject the product if lower sugar changes '
-                    'the expected Alphonso flavor experience.'
-                ),
-            },
-        ],
-    },
-    'mango_boba': {
-        'name': 'Mango Cheesecake Boba Shake',
-        'category': 'Youth trend',
-        'score': 73,
-        'momentum': 88,
-        'overlap': 51,
-        'margin': 57,
-        'complexity': 'High',
-        'competition': 'High',
-        'confidence': 'Medium',
-        'verdict': 'Research',
-        'price': '₹379–₹419',
-        'markets': ['Delhi NCR', 'Bengaluru', 'Mumbai'],
-        'outlets': 4,
-        'weeks': 3,
-        'customer': (
-            'Gen Z consumers seeking novelty and visually distinctive '
-            'products.'
-        ),
-        'summary': (
-            'A high-novelty concept with strong trend momentum but '
-            'meaningful sourcing, preparation, and margin complexity.'
-        ),
-        'ingredients': [
-            ('Mango pulp', 'Existing'),
-            ('Cream-cheese base', 'New'),
-            ('Boba pearls', 'New'),
-            ('Crumb topping', 'New'),
-            ('Milk base', 'Existing'),
-        ],
-        'signals': [
-            {
-                'title': 'Youth-category momentum',
-                'value': '+31% social velocity',
-                'impact': '+15 points',
-                'tone': 'positive',
-                'source': 'social',
-                'evidence': (
-                    'Boba and cheesecake combinations show strong short-term '
-                    'conversation growth in the mock scan.'
-                ),
-            },
-            {
-                'title': 'Visible menu growth',
-                'value': '22 new listings observed',
-                'impact': '+10 points',
-                'tone': 'positive',
-                'source': 'menus',
-                'evidence': (
-                    'Novel boba products appear more frequently across '
-                    'visible competitor assortments.'
-                ),
-            },
-            {
-                'title': 'Ingredient overlap',
-                'value': 'Only 51% existing overlap',
-                'impact': '-10 points',
-                'tone': 'risk',
-                'source': 'ingredients',
-                'evidence': (
-                    'Three important components are not part of the current '
-                    'mock ingredient master.'
-                ),
-            },
-            {
-                'title': 'Competitive crowding',
-                'value': 'High in premium urban markets',
-                'impact': '-8 points',
-                'tone': 'risk',
-                'source': 'menus',
-                'evidence': (
-                    'The product would enter a crowded novelty-beverage space.'
-                ),
-            },
-        ],
-    },
-    'matcha_coffee': {
-        'name': 'Matcha Cold Coffee',
-        'category': 'Premium experimentation',
-        'score': 64,
-        'momentum': 76,
-        'overlap': 68,
-        'margin': 61,
-        'complexity': 'Medium',
-        'competition': 'Low',
-        'confidence': 'Medium',
-        'verdict': 'Watch',
-        'price': '₹349–₹389',
-        'markets': ['Bengaluru', 'Mumbai', 'Gurugram'],
-        'outlets': 3,
-        'weeks': 3,
-        'customer': (
-            'Premium experimental consumers in major metropolitan markets.'
-        ),
-        'summary': (
-            'A niche premium concept with interesting momentum but '
-            'uncertain brand fit and a polarizing flavor profile.'
-        ),
-        'ingredients': [
-            ('Cold coffee base', 'Existing'),
-            ('Matcha powder', 'New'),
-            ('Vanilla support', 'Existing'),
-            ('Premium milk option', 'Existing'),
-        ],
-        'signals': [
-            {
-                'title': 'Premium search momentum',
-                'value': '+17% directional interest',
-                'impact': '+9 points',
-                'tone': 'positive',
-                'source': 'search',
-                'evidence': (
-                    'Matcha-related beverage interest is growing in selected '
-                    'premium urban catchments.'
-                ),
-            },
-            {
-                'title': 'Low direct competition',
-                'value': 'Limited comparable menu overlap',
-                'impact': '+6 points',
-                'tone': 'positive',
-                'source': 'menus',
-                'evidence': (
-                    'Few directly comparable matcha-coffee combinations were '
-                    'found in the mock competitor scan.'
-                ),
-            },
-            {
-                'title': 'Customer polarization',
-                'value': 'Mixed taste-language clusters',
-                'impact': '-9 points',
-                'tone': 'risk',
-                'source': 'reviews',
-                'evidence': (
-                    'Matcha flavor generates both strong enthusiasm and '
-                    'strong dislike in review-language clusters.'
-                ),
-            },
-            {
-                'title': 'Brand fit',
-                'value': 'Moderate',
-                'impact': '-7 points',
-                'tone': 'risk',
-                'source': 'sales',
-                'evidence': (
-                    'Current best-performing flavors are more familiar and '
-                    'indulgent than matcha.'
-                ),
-            },
-        ],
-    },
-}
 
 
 VERDICT_COLORS = {
@@ -612,21 +94,8 @@ TABLE_COLUMNS = [
 ]
 
 
-def _rows() -> list[dict[str, Any]]:
-    return [
-        {
-            'concept_id': concept_id,
-            'name': concept['name'],
-            'category': concept['category'],
-            'score': concept['score'],
-            'momentum': concept['momentum'],
-            'overlap_text': f"{concept['overlap']}%",
-            'margin_text': f"{concept['margin']}%",
-            'complexity': concept['complexity'],
-            'verdict': concept['verdict'],
-        }
-        for concept_id, concept in CONCEPTS.items()
-    ]
+def _rows(concepts: dict[str, dict[str, Any]]) -> list[dict[str, Any]]:
+    return build_product_rows(concepts)
 
 
 def _nav_item(
@@ -825,6 +294,8 @@ def _render_shell(ai_chat: AIChatController) -> None:
         with ui.row().classes(
             'items-center gap-3'
         ):
+            render_brand_session_controls()
+
             ui.badge(
                 'CONCEPT DATA',
                 color='secondary',
@@ -889,9 +360,9 @@ def _metric_card(
     return value_label, subtitle_label
 
 
-def _chart_options() -> dict[str, Any]:
+def _chart_options(concept_catalog: dict[str, dict[str, Any]]) -> dict[str, Any]:
     concepts = sorted(
-        CONCEPTS.values(),
+        concept_catalog.values(),
         key=lambda item: item['momentum'],
     )
 
@@ -976,6 +447,16 @@ def _replace_chart(
 
 @ui.page('/product-innovation')
 def product_innovation_page() -> None:
+    profile = require_brand_login()
+    if profile is None:
+        return
+
+    brand_state = get_brand_state(app.storage.user, profile['brand_id'])
+    innovation_state = ensure_product_innovation_state(brand_state)
+    concepts = get_product_concepts(brand_state)
+    pilot_plans = get_pilot_plans(brand_state)
+    signal_baseline = 1_420 if profile['country_code'] == 'CA' else 1_840
+
     apply_theme()
 
     ui.add_css(
@@ -1006,7 +487,7 @@ def product_innovation_page() -> None:
     )
     _render_shell(ai_chat)
 
-    table_rows = _rows()
+    table_rows = _rows(concepts)
 
     rows_by_id = {
         row['concept_id']: row
@@ -1018,9 +499,7 @@ def product_innovation_page() -> None:
         'category': 'All opportunities',
         'verdict': 'All verdicts',
         'search': '',
-        'scan_number': 0,
         'pilot_concept_id': None,
-        'pilot_plans': {},
     }
 
     refs: dict[str, Any] = {}
@@ -1124,7 +603,7 @@ def product_innovation_page() -> None:
     def open_pilot_dialog(
         concept_id: str,
     ) -> None:
-        concept = CONCEPTS[concept_id]
+        concept = concepts[concept_id]
 
         state['pilot_concept_id'] = concept_id
 
@@ -1148,18 +627,14 @@ def product_innovation_page() -> None:
             concept['weeks']
         )
 
-        refs['pilot_price'].value = int(
-            concept['price']
-            .replace('₹', '')
-            .split('–')[0]
-        )
+        refs['pilot_price'].value = float(concept['test_price'])
 
         refs['pilot_dialog'].open()
 
     def render_detail(
         concept_id: str,
     ) -> None:
-        concept = CONCEPTS[concept_id]
+        concept = concepts[concept_id]
 
         refs['detail'].clear()
 
@@ -1198,9 +673,11 @@ def product_innovation_page() -> None:
                     )
 
                     ui.label(
-                        state['pilot_plans'].get(
-                            concept_id,
-                            'No pilot plan created',
+                        (
+                            f"Pilot planned · {pilot_plans[concept_id]['outlet_count']} outlets · "
+                            f"{pilot_plans[concept_id]['duration_weeks']} weeks"
+                            if concept_id in pilot_plans
+                            else 'No pilot plan created'
                         )
                     ).classes(
                         'text-xs muted'
@@ -1486,7 +963,7 @@ def product_innovation_page() -> None:
     def select_concept(
         concept_id: str,
     ) -> None:
-        if concept_id not in CONCEPTS:
+        if concept_id not in concepts:
             return
 
         state['selected_id'] = concept_id
@@ -1570,32 +1047,9 @@ def product_innovation_page() -> None:
 
         await asyncio.sleep(1.25)
 
-        state['scan_number'] += 1
+        scan_number = refresh_market_scan(brand_state)
 
-        for concept_id, concept in CONCEPTS.items():
-            rng = random.Random(
-                sum(ord(char) for char in concept_id)
-                + state['scan_number'] * 733
-            )
-
-            concept['momentum'] = max(
-                45,
-                min(
-                    98,
-                    concept['momentum']
-                    + rng.randint(-4, 5),
-                ),
-            )
-
-            concept['score'] = max(
-                50,
-                min(
-                    95,
-                    concept['score']
-                    + rng.randint(-2, 3),
-                ),
-            )
-
+        for concept_id, concept in concepts.items():
             row = rows_by_id[concept_id]
             row['momentum'] = concept['momentum']
             row['score'] = concept['score']
@@ -1606,16 +1060,16 @@ def product_innovation_page() -> None:
 
         _replace_chart(
             refs['momentum_chart'],
-            _chart_options(),
+            _chart_options(concepts),
         )
 
         refs['signals_scanned'].set_text(
-            f"{1840 + state['scan_number'] * 137:,}"
+            f"{signal_baseline + scan_number * 137:,}"
         )
 
         refs['last_scan'].set_text(
             f"Updated {datetime.now():%H:%M} · "
-            f"Market scan {state['scan_number'] + 1}"
+            f"Market scan {scan_number}"
         )
 
         select_concept(
@@ -1637,17 +1091,21 @@ def product_innovation_page() -> None:
             'pilot_concept_id'
         )
 
-        if concept_id not in CONCEPTS:
+        if concept_id not in concepts:
             return
 
-        concept = CONCEPTS[concept_id]
+        concept = concepts[concept_id]
         markets = refs['pilot_markets'].value or []
 
-        state['pilot_plans'][concept_id] = (
-            f"Pilot planned · "
-            f"{int(refs['pilot_outlets'].value)} outlets · "
-            f"{int(refs['pilot_duration'].value)} weeks"
+        plan = persist_pilot_plan(
+            brand_state,
+            concept_id=concept_id,
+            markets=list(markets),
+            outlet_count=int(refs['pilot_outlets'].value),
+            duration_weeks=int(refs['pilot_duration'].value),
+            test_price=float(refs['pilot_price'].value),
         )
+        pilot_plans[concept_id] = plan
 
         refs['pilot_dialog'].close()
         render_detail(concept_id)
@@ -1656,10 +1114,10 @@ def product_innovation_page() -> None:
             (
                 f"{concept['name']} will be tested in "
                 f"{', '.join(markets)} across "
-                f"{int(refs['pilot_outlets'].value)} outlets "
-                f"for {int(refs['pilot_duration'].value)} weeks "
-                f"at a proposed price of ₹"
-                f"{int(refs['pilot_price'].value)}."
+                f"{plan['outlet_count']} outlets "
+                f"for {plan['duration_weeks']} weeks "
+                f"at a proposed price of "
+                f"{format_money(plan['test_price'], profile, compact=False)}."
             )
         )
 
@@ -1695,7 +1153,7 @@ def product_innovation_page() -> None:
 
         ui.download(
             buffer.getvalue().encode('utf-8'),
-            filename='product_opportunity_portfolio.csv',
+            filename=f"{profile['brand_id']}_product_opportunity_portfolio.csv",
             media_type='text/csv',
         )
 
@@ -1779,11 +1237,11 @@ def product_innovation_page() -> None:
                 )
 
                 refs['pilot_price'] = ui.number(
-                    label='Test price ₹',
-                    value=349,
-                    min=99,
-                    max=999,
-                    step=10,
+                    label=f"Test price {profile['currency_symbol']}",
+                    value=(7.45 if profile['currency_code'] == 'CAD' else 349),
+                    min=(1 if profile['currency_code'] == 'CAD' else 99),
+                    max=(50 if profile['currency_code'] == 'CAD' else 999),
+                    step=(0.25 if profile['currency_code'] == 'CAD' else 10),
                 ).props(
                     'outlined dense'
                 )
@@ -1932,14 +1390,18 @@ def product_innovation_page() -> None:
                 'items-end gap-1 desktop-only'
             ):
                 ui.badge(
-                    f'{len(CONCEPTS)} MOCK CONCEPTS',
+                    f"{len(concepts)} {profile['country'].upper()} MOCK CONCEPTS",
                     color='positive',
                 ).props(
                     'outline'
                 )
 
                 refs['last_scan'] = ui.label(
-                    'Simulated market scan · Ready'
+                    (
+                        f"Simulated market scan {innovation_state['market_scan_run_number']} · Ready"
+                        if innovation_state['market_scan_run_number']
+                        else 'Simulated market scan · Ready'
+                    )
                 ).classes(
                     'text-xs muted'
                 )
@@ -1953,7 +1415,7 @@ def product_innovation_page() -> None:
                     *sorted(
                         {
                             concept['category']
-                            for concept in CONCEPTS.values()
+                            for concept in concepts.values()
                         }
                     ),
                 ],
@@ -2021,16 +1483,16 @@ def product_innovation_page() -> None:
 
         pilot_ready = sum(
             1
-            for concept in CONCEPTS.values()
+            for concept in concepts.values()
             if concept['verdict'] == 'Pilot'
         )
 
         average_overlap = (
             sum(
                 concept['overlap']
-                for concept in CONCEPTS.values()
+                for concept in concepts.values()
             )
-            / len(CONCEPTS)
+            / len(concepts)
         )
 
         with ui.grid(
@@ -2045,8 +1507,8 @@ def product_innovation_page() -> None:
                 refs['signals_scanned_sub'],
             ) = _metric_card(
                 'Signals scanned',
-                '1,840',
-                'Mock public and internal signals',
+                f"{signal_baseline + int(innovation_state['market_scan_run_number']) * 137:,}",
+                f"Mock {profile['country']} public and internal signals",
                 'manage_search',
             )
 
@@ -2066,7 +1528,7 @@ def product_innovation_page() -> None:
 
             _metric_card(
                 'Top opportunity score',
-                f"{max(c['score'] for c in CONCEPTS.values())} / 100",
+                f"{max(c['score'] for c in concepts.values())} / 100",
                 'Highest current concept score',
                 'stars',
             )
@@ -2106,7 +1568,7 @@ def product_innovation_page() -> None:
                     )
 
                 refs['momentum_chart'] = ui.echart(
-                    _chart_options()
+                    _chart_options(concepts)
                 ).classes(
                     'w-full h-[390px] mt-2'
                 )

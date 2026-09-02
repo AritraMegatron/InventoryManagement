@@ -20,11 +20,13 @@ load_dotenv(
 )
 
 
+from app.pages import login  # noqa: E402,F401
 from app.pages import command_center  # noqa: E402,F401
 from app.pages import demand_inventory  # noqa: E402,F401
 from app.pages import network_intelligence  # noqa: E402,F401
 from app.pages import outlet_intelligence  # noqa: E402,F401
 from app.pages import product_innovation  # noqa: E402,F401
+from app.services.auth_service import is_authenticated  # noqa: E402
 
 
 app.add_static_files(
@@ -37,6 +39,8 @@ app.add_static_files(
 def index() -> None:
     ui.navigate.to(
         '/command-center'
+        if is_authenticated(app.storage.user)
+        else '/login'
     )
 
 

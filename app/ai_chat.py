@@ -1,7 +1,6 @@
 from __future__ import annotations
 
-import asyncio
-from typing import Any, MutableMapping
+from typing import Any, Callable, Coroutine, MutableMapping
 
 from nicegui import app, ui
 
@@ -10,6 +9,9 @@ from app.openai_service import (
     OpenAIResponseError,
     VesperOpenAIService,
 )
+from app.services.ai_live_state_service import build_live_state_context
+from app.services.auth_service import get_authenticated_brand_id
+from app.state.demo_state import get_brand_state
 
 
 CHAT_STORAGE_KEY = 'vesper_ai_chat'
@@ -41,7 +43,6 @@ class AIChatController:
         # This storage belongs to the current browser/user and survives
         # navigation between NiceGUI pages.
         self.storage: MutableMapping[str, Any] = app.storage.user
-
         stored_state = self._read_stored_state()
 
         self.history: list[dict[str, str]] = stored_state['history']
@@ -326,7 +327,7 @@ class AIChatController:
             else 'icon=remove'
         )
 
-    def _handle_enter(
+    async def _handle_enter(
         self,
         event: Any,
     ) -> None:
@@ -343,9 +344,7 @@ class AIChatController:
         ):
             return
 
-        asyncio.create_task(
-            self.send()
-        )
+        await self.send()
 
     def _render_messages(self) -> None:
         self.refs['messages'].clear()
@@ -369,9 +368,9 @@ class AIChatController:
                 'p-3 shadow-none'
             ):
                 ui.label(
-                    'Ask me about current business performance, '
-                    'inventory risks, outlet economics, market '
-                    'questions, or new dessert and beverage ideas.'
+                    'Ask me about the live Vesper workspace: business performance, '
+                    'inventory risks and plans, outlet economics, approvals, '
+                    'location candidates, or product opportunities.'
                 ).classes(
                     'text-sm leading-relaxed'
                 )
@@ -388,9 +387,7 @@ class AIChatController:
             for suggestion in suggestions:
                 ui.button(
                     suggestion,
-                    on_click=lambda text=suggestion: (
-                        self.ask_suggestion(text)
-                    ),
+                    on_click=self._suggestion_handler(suggestion),
                 ).props(
                     'outline dense no-caps'
                 ).classes(
@@ -434,16 +431,22 @@ class AIChatController:
                         'text-sm leading-relaxed'
                     )
 
-    def ask_suggestion(
+    def _suggestion_handler(
+        self,
+        text: str,
+    ) -> Callable[[], Coroutine[Any, Any, None]]:
+        async def handler() -> None:
+            await self.ask_suggestion(text)
+
+        return handler
+
+    async def ask_suggestion(
         self,
         text: str,
     ) -> None:
         self.refs['input'].value = text
         self.refs['input'].update()
-
-        asyncio.create_task(
-            self.send()
-        )
+        await self.send()
 
     async def send(self) -> None:
         if self.is_busy:
@@ -479,10 +482,28 @@ class AIChatController:
         self._set_busy(True)
 
         try:
+            brand_id = get_authenticated_brand_id(self.storage)
+            if brand_id is None:
+                raise OpenAIResponseError(
+                    'The Vesper brand session is no longer available. Please sign in again.'
+                )
+
+            brand_state = get_brand_state(self.storage, brand_id)
+            # The live-state service reads only canonical, JSON-safe brand
+            # state. AI chat must never resolve app.storage.tab: tab storage
+            # requires an active NiceGUI client/slot and is not safe to access
+            # during async model calls or during initial HTTP page rendering.
+            live_state_context = build_live_state_context(
+                brand_state,
+                user_query=message,
+                page_name=self.page_name,
+            )
+
             answer = await self.service.answer(
                 history=self.history,
                 page_name=self.page_name,
                 page_context=self.page_context,
+                live_state_context=live_state_context,
             )
 
             self.history.append(
@@ -493,21 +514,25 @@ class AIChatController:
             )
 
         except OpenAIConfigurationError as exc:
+            print('[Vesper AI] Configuration error:', exc)
             self.history.append(
                 {
                     'role': 'assistant',
                     'content': (
-                        f'**Configuration required:** {exc}'
+                        '**Vesper AI is not configured for this environment.** '
+                        'Check the server AI settings and try again.'
                     ),
                 }
             )
 
         except OpenAIResponseError as exc:
+            print('[Vesper AI] Request error:', exc)
             self.history.append(
                 {
                     'role': 'assistant',
                     'content': (
-                        f'**Unable to answer:** {exc}'
+                        '**Vesper AI could not complete that request.** '
+                        'Please try again in a moment.'
                     ),
                 }
             )

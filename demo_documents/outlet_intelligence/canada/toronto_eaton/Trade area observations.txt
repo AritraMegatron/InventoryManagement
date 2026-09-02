@@ -1,0 +1,15 @@
+TRADE AREA OBSERVATIONS
+Yonge & Dundas, Toronto
+220 Yonge Street, Toronto, Ontario M5B 2H1, Canada
+
+DEMO DOCUMENT - Fictional trade-area observations for Vesper presentation only.
+
+- Primary catchment: Downtown Toronto pedestrian, transit, office, student and tourist traffic.
+- Demand pattern: Broad all-day demand with especially strong afternoon / evening pedestrian volume.
+- Competition: Several premium coffee and beverage operators within the immediate downtown walk radius.
+- Delivery: High demand potential, but rider staging and back-of-house scheduling need discipline.
+- Occupancy benchmark: All-in occupancy cost should remain tightly controlled relative to modeled monthly sales.
+- Cannibalization: Medium due to overlap with existing Toronto trade areas in the synthetic network.
+- Decision note: Strongest demand profile in the shortlist; occupancy cost is the principal diligence item.
+
+Synthetic demo record. Not live market research and not a representation by the named property.

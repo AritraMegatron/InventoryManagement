@@ -3,8 +3,12 @@ from __future__ import annotations
 from copy import deepcopy
 from typing import Any
 
+from app.data.brand_catalog import CANADA_BRAND_ID, INDIA_BRAND_ID
+from app.data.outlet_candidates_canada import CANADA_DEFAULT_CANDIDATES
+from app.data.demo_document_loader import load_demo_document
 
-OUTLET_STATE_SCHEMA_VERSION = 2
+
+OUTLET_STATE_SCHEMA_VERSION = 3
 
 SOURCE_CATALOG = {
     'team': (
@@ -62,23 +66,17 @@ def _demo_document(
     size_bytes: int,
     mock_extract: str,
 ) -> dict[str, Any]:
-    """Create metadata for a preloaded demo document.
-
-    The original binary is intentionally not embedded in source code. These
-    records make every initial candidate look complete while the analysis
-    panel remains explicit that the document content is simulated.
-    """
-
-    return {
-        'id': document_id,
-        'name': name,
-        'content_type': content_type,
-        'size_bytes': size_bytes,
-        'content': None,
-        'source': 'demo',
-        'mock_extract': mock_extract,
-        'analysis_status': 'Analyzed demo document',
-    }
+    # ``size_bytes`` is retained in the call signature so the synthetic data
+    # definitions remain easy to read. The real packaged demo file determines
+    # the actual byte count used by the UI and RAG engine.
+    _ = size_bytes
+    return load_demo_document(
+        country_folder='india',
+        document_id=document_id,
+        name=name,
+        content_type=content_type,
+        mock_extract=mock_extract,
+    )
 
 
 def _demo_analysis(
@@ -103,8 +101,8 @@ def _demo_analysis(
         'evidence': evidence,
         'source_mode': 'demo',
         'warnings': [
-            'The preloaded files are representative demo records; no original '
-            'binary file was supplied with the prototype.',
+            'These are synthetic demo documents created for the Vesper presentation; '
+            'all commercial and site details are fictional.',
         ],
     }
 
@@ -684,17 +682,31 @@ DEFAULT_CANDIDATES: dict[str, dict[str, Any]] = {
 }
 
 
-def clone_default_candidates() -> dict[str, dict[str, Any]]:
-    """Return an independent copy suitable for per-tab mutable demo state."""
+def get_default_candidates(brand_id: str = INDIA_BRAND_ID) -> dict[str, dict[str, Any]]:
+    """Return the immutable baseline candidate catalog for one demo brand."""
 
-    return deepcopy(DEFAULT_CANDIDATES)
+    if brand_id == CANADA_BRAND_ID:
+        return CANADA_DEFAULT_CANDIDATES
+    return DEFAULT_CANDIDATES
 
 
-def create_empty_candidate(candidate_id: str) -> dict[str, Any]:
+def clone_default_candidates(
+    brand_id: str = INDIA_BRAND_ID,
+) -> dict[str, dict[str, Any]]:
+    """Return an independent copy suitable for brand-scoped mutable demo state."""
+
+    return deepcopy(get_default_candidates(brand_id))
+
+
+def create_empty_candidate(
+    candidate_id: str,
+    brand_id: str = INDIA_BRAND_ID,
+) -> dict[str, Any]:
     """Create a complete schema for a newly added candidate."""
 
     return {
         'id': candidate_id,
+        'brand_id': brand_id,
         'name': '',
         'city': '',
         'state': '',

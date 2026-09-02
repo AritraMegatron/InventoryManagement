@@ -10,17 +10,23 @@ from nicegui import app, ui
 
 from app.ai_chat import AIChatController, create_ai_chat
 from app.company_context import PAGE_CONTEXTS
+from app.session_ui import require_brand_login, render_brand_session_controls
 from app.data.outlet_candidates import (
     OUTLET_STATE_SCHEMA_VERSION,
     SOURCE_CATALOG,
     clone_default_candidates,
     create_empty_candidate,
 )
+from app.services.currency_service import format_money
 from app.services.location_service import (
     LocationSuggestion,
     create_location_service,
 )
 from app.services.outlet_analysis import calculate_location_analysis
+from app.services.outlet_state_service import (
+    OUTLET_PROCESS_BOOT_ID,
+    persist_outlet_ai_snapshot,
+)
 from app.services.outlet_document_analysis import (
     MAX_DOCUMENTS,
     MAX_FILE_BYTES,
@@ -30,14 +36,11 @@ from app.services.outlet_document_analysis import (
     OutletDocumentAnalysisError,
     validate_document,
 )
+from app.state.demo_state import get_brand_state
 from app.theme import BURGUNDY, GOLD, GREEN, RED, apply_theme
 
 
 OUTLET_STORAGE_KEY = 'vesper_outlet_intelligence_v2'
-# A new value is created every time this Python module starts. Including it in
-# tab state guarantees that even Redis-backed tab storage returns to the four
-# original candidates after a demo/server restart.
-OUTLET_PROCESS_BOOT_ID = uuid.uuid4().hex
 STATUS_COLORS = {
     'Recommended': GREEN,
     'Review': GOLD,
@@ -45,8 +48,22 @@ STATUS_COLORS = {
 }
 
 
-def _format_lakh(value: float) -> str:
-    return f'₹{value:.1f} lakh'
+def _format_candidate_money(
+    value: float,
+    profile: dict[str, Any],
+) -> str:
+    # India candidate economics currently preserve the established MVP lakh
+    # units; Canadian candidates use native CAD. Both are formatted here so
+    # country-specific presentation never leaks into the page logic.
+    if profile.get('currency_code') == 'INR':
+        return f'₹{value:.1f} lakh'
+    return format_money(value, profile, compact=True)
+
+
+def _coordinate_bounds(profile: dict[str, Any]) -> tuple[float, float, float, float]:
+    if profile.get('country_code') == 'CA':
+        return 41.0, 84.0, -141.0, -52.0
+    return 6.0, 38.0, 68.0, 98.0
 
 
 def _format_bytes(size_bytes: int) -> str:
@@ -55,6 +72,33 @@ def _format_bytes(size_bytes: int) -> str:
     if size_bytes < 1024 * 1024:
         return f'{size_bytes / 1024:.1f} KB'
     return f'{size_bytes / (1024 * 1024):.1f} MB'
+
+
+def _document_source_label(document: dict[str, Any]) -> str:
+    size = _format_bytes(int(document.get('size_bytes') or 0))
+    if document.get('source') == 'demo':
+        if isinstance(document.get('content'), (bytes, bytearray)):
+            return f'Preloaded demo document · {size}'
+        return 'Preloaded demo metadata'
+    return size
+
+
+def _download_document(document: dict[str, Any]) -> None:
+    content = document.get('content')
+    if not isinstance(content, (bytes, bytearray)):
+        ui.notify(
+            'This record does not contain a downloadable file.',
+            type='warning',
+        )
+        return
+
+    ui.download(
+        bytes(content),
+        filename=str(document.get('name') or 'document'),
+        media_type=str(
+            document.get('content_type') or 'application/octet-stream'
+        ),
+    )
 
 
 def _status(status: str) -> None:
@@ -208,6 +252,8 @@ def _render_shell(ai_chat: AIChatController) -> None:
                 )
 
         with ui.row().classes('items-center gap-3'):
+            render_brand_session_controls()
+
             ui.badge('CONCEPT DATA', color='secondary').props(
                 'outline'
             ).classes('desktop-only')
@@ -218,27 +264,36 @@ def _render_shell(ai_chat: AIChatController) -> None:
             ).props('unelevated no-caps').classes('rounded-xl')
 
 
-def _get_tab_state() -> dict[str, Any]:
-    stored = app.storage.tab.get(OUTLET_STORAGE_KEY)
+def _get_tab_state(brand_id: str) -> dict[str, Any]:
+    storage_key = f'{OUTLET_STORAGE_KEY}:{brand_id}'
+    stored = app.storage.tab.get(storage_key)
     if (
         not isinstance(stored, dict)
         or stored.get('schema_version') != OUTLET_STATE_SCHEMA_VERSION
         or stored.get('process_boot_id') != OUTLET_PROCESS_BOOT_ID
+        or stored.get('brand_id') != brand_id
         or not isinstance(stored.get('candidates'), dict)
     ):
         stored = {
             'schema_version': OUTLET_STATE_SCHEMA_VERSION,
             'process_boot_id': OUTLET_PROCESS_BOOT_ID,
-            'candidates': clone_default_candidates(),
+            'brand_id': brand_id,
+            'candidates': clone_default_candidates(brand_id),
             'decisions': {},
             'selected': None,
         }
-        app.storage.tab[OUTLET_STORAGE_KEY] = stored
+        app.storage.tab[storage_key] = stored
     return stored
 
 
 @ui.page('/outlet-intelligence')
 async def outlet_intelligence_page() -> None:
+    brand_profile = require_brand_login()
+    if brand_profile is None:
+        return
+    brand_id = str(brand_profile['brand_id'])
+    brand_state = get_brand_state(app.storage.user, brand_id)
+
     apply_theme()
     ui.add_css(
         '''
@@ -293,24 +348,40 @@ async def outlet_intelligence_page() -> None:
     # This is what lets edits survive route navigation while a server restart
     # restores the original four demo candidates.
     await ui.context.client.connected()
-    tab_state = _get_tab_state()
+    tab_state = _get_tab_state(brand_id)
     candidates: dict[str, dict[str, Any]] = tab_state['candidates']
     decisions: dict[str, str] = tab_state.setdefault('decisions', {})
     page_state = {
         'selected': tab_state.get('selected'),
         'analysis_run': 0,
     }
+    persist_outlet_ai_snapshot(
+        brand_state,
+        candidates=candidates,
+        decisions=decisions,
+        selected=page_state['selected'],
+    )
     refs: dict[str, Any] = {}
     marker_layers: dict[str, Any] = {}
     map_event_name = f'outlet-candidate-{uuid.uuid4().hex}'
-    location_service = create_location_service()
+    location_service = create_location_service(brand_profile)
     document_service = OutletDocumentAnalysisService()
 
     def persist_state() -> None:
         tab_state['selected'] = page_state['selected']
         tab_state['candidates'] = candidates
         tab_state['decisions'] = decisions
-        app.storage.tab[OUTLET_STORAGE_KEY] = tab_state
+        app.storage.tab[f'{OUTLET_STORAGE_KEY}:{brand_id}'] = tab_state
+
+        # Publish only the small AI-safe view to canonical brand state. Raw
+        # uploaded document bytes remain in tab storage and are never copied
+        # into app.storage.user.
+        persist_outlet_ai_snapshot(
+            brand_state,
+            candidates=candidates,
+            decisions=decisions,
+            selected=page_state['selected'],
+        )
 
     def update_candidate_count() -> None:
         if 'candidate_count' in refs:
@@ -543,9 +614,9 @@ async def outlet_intelligence_page() -> None:
                 )
                 _metric(
                     'Expected monthly sales',
-                    _format_lakh(float(candidate['sales'])),
+                    _format_candidate_money(float(candidate['sales']), brand_profile),
                     'Simulated base scenario',
-                    'currency_rupee',
+                    'payments',
                 )
                 _metric(
                     'Contribution margin',
@@ -594,10 +665,15 @@ async def outlet_intelligence_page() -> None:
                         'w-full gap-3 mt-4 max-[650px]:grid-cols-1'
                     ):
                         for label, value in (
-                            ('Monthly rent', _format_lakh(float(candidate['rent']))),
+                            ('Monthly rent', _format_candidate_money(float(candidate['rent']), brand_profile)),
                             ('Square footage', f"{candidate['sqft']:,} sq. ft."),
                             ('City', candidate.get('city') or 'Not supplied'),
-                            ('PIN code', candidate.get('pincode') or 'Not supplied'),
+                            (
+                                'Postal code'
+                                if brand_profile.get('country_code') == 'CA'
+                                else 'PIN code',
+                                candidate.get('pincode') or 'Not supplied',
+                            ),
                         ):
                             with ui.column().classes('gap-0'):
                                 ui.label(label).classes(
@@ -626,21 +702,31 @@ async def outlet_intelligence_page() -> None:
                         )
                     for document in documents:
                         with ui.row().classes(
-                            'items-center gap-2 no-wrap mt-1'
+                            'w-full items-center justify-between gap-2 no-wrap mt-1'
                         ):
-                            ui.icon('description').classes('text-primary')
-                            with ui.column().classes('gap-0 min-w-0'):
-                                ui.label(
-                                    str(document.get('name') or 'Document')
-                                ).classes('text-sm font-medium truncate')
-                                source = (
-                                    'Preloaded demo metadata'
-                                    if document.get('source') == 'demo'
-                                    else _format_bytes(
-                                        int(document.get('size_bytes') or 0)
-                                    )
-                                )
-                                ui.label(source).classes('text-[10px] muted')
+                            with ui.row().classes(
+                                'items-center gap-2 no-wrap min-w-0'
+                            ):
+                                ui.icon('description').classes('text-primary')
+                                with ui.column().classes('gap-0 min-w-0'):
+                                    ui.label(
+                                        str(document.get('name') or 'Document')
+                                    ).classes('text-sm font-medium truncate')
+                                    ui.label(
+                                        _document_source_label(document)
+                                    ).classes('text-[10px] muted')
+                            if isinstance(
+                                document.get('content'),
+                                (bytes, bytearray),
+                            ):
+                                ui.button(
+                                    icon='download',
+                                    on_click=lambda _event=None, doc=document: (
+                                        _download_document(doc)
+                                    ),
+                                ).props(
+                                    'flat round dense color=primary'
+                                ).tooltip('Download demo document')
 
                 with ui.card().classes(
                     'verdict-panel col-span-3 p-5 w-full '
@@ -823,7 +909,14 @@ async def outlet_intelligence_page() -> None:
                     12,
                 )
         elif not candidates:
-            candidate_map.run_map_method('setView', [22.7, 79.4], 5)
+            candidate_map.run_map_method(
+                'setView',
+                [
+                    float(brand_profile['map_center_lat']),
+                    float(brand_profile['map_center_lon']),
+                ],
+                int(brand_profile['map_zoom']),
+            )
 
     async def analyze(candidate_id: str) -> None:
         candidate = candidates.get(candidate_id)
@@ -865,7 +958,10 @@ async def outlet_intelligence_page() -> None:
             return
 
         try:
-            document_analysis = await document_service.analyze(candidate)
+            document_analysis = await document_service.analyze(
+                candidate,
+                profile=brand_profile,
+            )
         except OutletDocumentAnalysisError as exc:
             refs['analysis'].clear()
             ui.notify(str(exc), type='negative')
@@ -881,7 +977,7 @@ async def outlet_intelligence_page() -> None:
             'Calculating location economics and risk signals…',
         ):
             return
-        calculate_location_analysis(candidate, candidates)
+        calculate_location_analysis(candidate, candidates, brand_profile)
 
         if not await set_progress(
             0.86,
@@ -918,7 +1014,7 @@ async def outlet_intelligence_page() -> None:
         is_new = candidate_id is None
         if is_new:
             working_id = f'candidate-{uuid.uuid4().hex[:10]}'
-            draft = create_empty_candidate(working_id)
+            draft = create_empty_candidate(working_id, brand_id)
         else:
             if candidate_id not in candidates:
                 ui.notify('Candidate no longer exists.', type='warning')
@@ -972,19 +1068,31 @@ async def outlet_intelligence_page() -> None:
                     name_input = ui.input(
                         'Location name',
                         value=str(draft.get('name') or ''),
-                        placeholder='Example: Phoenix Marketcity, Pune',
+                        placeholder=(
+                            'Example: CF Toronto Eaton Centre'
+                            if brand_profile.get('country_code') == 'CA'
+                            else 'Example: Phoenix Marketcity, Pune'
+                        ),
                     ).props('outlined')
                     rent_input = ui.number(
-                        'Monthly rent in lakh INR *',
+                        (
+                            'Monthly rent in CAD *'
+                            if brand_profile.get('country_code') == 'CA'
+                            else 'Monthly rent in lakh INR *'
+                        ),
                         value=float(draft.get('rent') or 0.0),
-                        min=0.01,
-                        step=0.05,
+                        min=(100.0 if brand_profile.get('country_code') == 'CA' else 0.01),
+                        step=(100.0 if brand_profile.get('country_code') == 'CA' else 0.05),
                     ).props('outlined')
 
                 address_input = ui.input(
                     'Full address *',
                     value=str(draft.get('address') or ''),
-                    placeholder='Start typing an Indian locality, road or POI',
+                    placeholder=(
+                        'Start typing a Canadian city, mall or address'
+                        if brand_profile.get('country_code') == 'CA'
+                        else 'Start typing an Indian locality, road or POI'
+                    ),
                 ).props('outlined clearable').classes('w-full mt-3')
 
                 with ui.row().classes(
@@ -994,8 +1102,12 @@ async def outlet_intelligence_page() -> None:
                         f'Live suggestions: {location_service.provider_label}'
                         if location_service.is_live
                         else (
-                            'Offline demo suggestions active. Add '
-                            'MAPPLS_REST_KEY for live Indian search.'
+                            'Offline Canadian demo suggestions active.'
+                            if brand_profile.get('country_code') == 'CA'
+                            else (
+                                'Offline demo suggestions active. Add '
+                                'MAPPLS_REST_KEY for live Indian search.'
+                            )
                         )
                     )
                     address_status = ui.label(provider_text).classes(
@@ -1130,7 +1242,9 @@ async def outlet_intelligence_page() -> None:
                             'Type at least 3 characters for suggestions.'
                         )
                         return
-                    address_status.set_text('Searching Indian addresses…')
+                    address_status.set_text(
+                        f"Searching {brand_profile['country']} addresses…"
+                    )
                     await asyncio.sleep(0.40)
                     if generation != search_state['generation']:
                         return
@@ -1161,13 +1275,25 @@ async def outlet_intelligence_page() -> None:
                         value=str(draft.get('city') or ''),
                     ).props('outlined')
                     state_input = ui.input(
-                        'State',
+                        (
+                            'Province'
+                            if brand_profile.get('country_code') == 'CA'
+                            else 'State'
+                        ),
                         value=str(draft.get('state') or ''),
                     ).props('outlined')
                     pincode_input = ui.input(
-                        'PIN code',
+                        (
+                            'Postal code'
+                            if brand_profile.get('country_code') == 'CA'
+                            else 'PIN code'
+                        ),
                         value=str(draft.get('pincode') or ''),
-                    ).props('outlined mask=######')
+                    )
+                    if brand_profile.get('country_code') == 'CA':
+                        pincode_input.props('outlined')
+                    else:
+                        pincode_input.props('outlined mask=######')
 
                 with ui.grid(columns=2).classes(
                     'w-full gap-4 mt-3 max-[760px]:grid-cols-1'
@@ -1303,25 +1429,32 @@ async def outlet_intelligence_page() -> None:
                                         ).classes(
                                             'text-sm font-bold truncate'
                                         )
-                                        source = (
-                                            'Preloaded demo metadata'
-                                            if document.get('source') == 'demo'
-                                            else _format_bytes(
-                                                int(
-                                                    document.get('size_bytes')
-                                                    or 0
-                                                )
-                                            )
-                                        )
-                                        ui.label(source).classes(
+                                        ui.label(
+                                            _document_source_label(document)
+                                        ).classes(
                                             'text-[10px] muted'
                                         )
-                                ui.button(
-                                    icon='delete_outline',
-                                    on_click=remove_document,
-                                ).props(
-                                    'flat round dense color=negative'
-                                )
+                                with ui.row().classes(
+                                    'items-center gap-1 no-wrap shrink-0'
+                                ):
+                                    if isinstance(
+                                        document.get('content'),
+                                        (bytes, bytearray),
+                                    ):
+                                        ui.button(
+                                            icon='download',
+                                            on_click=lambda _event=None, doc=document: (
+                                                _download_document(doc)
+                                            ),
+                                        ).props(
+                                            'flat round dense color=primary'
+                                        ).tooltip('Download document')
+                                    ui.button(
+                                        icon='delete_outline',
+                                        on_click=remove_document,
+                                    ).props(
+                                        'flat round dense color=negative'
+                                    )
 
                 document_list()
 
@@ -1467,10 +1600,16 @@ async def outlet_intelligence_page() -> None:
                             type='negative',
                         )
                         return
-                    if not (6.0 <= lat_float <= 38.0 and 68.0 <= lng_float <= 98.0):
+                    min_lat, max_lat, min_lng, max_lng = _coordinate_bounds(
+                        brand_profile
+                    )
+                    if not (
+                        min_lat <= lat_float <= max_lat
+                        and min_lng <= lng_float <= max_lng
+                    ):
                         ui.notify(
-                            'Coordinates must fall within the supported India '
-                            'demo bounds.',
+                            'Coordinates must fall within the supported '
+                            f"{brand_profile['country']} demo bounds.",
                             type='negative',
                         )
                         return
@@ -1526,7 +1665,7 @@ async def outlet_intelligence_page() -> None:
                             'Saved · run Analyze for document review'
                         )
 
-                    calculate_location_analysis(draft, candidates)
+                    calculate_location_analysis(draft, candidates, brand_profile)
                     if materially_changed:
                         draft['analysis_status'] = (
                             'Preliminary · document analysis pending'
@@ -1632,7 +1771,7 @@ async def outlet_intelligence_page() -> None:
 
                 async def confirm_reset() -> None:
                     candidates.clear()
-                    candidates.update(clone_default_candidates())
+                    candidates.update(clone_default_candidates(brand_id))
                     decisions.clear()
                     page_state['selected'] = None
                     page_state['analysis_run'] += 1
@@ -1692,7 +1831,7 @@ async def outlet_intelligence_page() -> None:
                                 'text-sm font-bold truncate'
                             )
                             ui.label(
-                                f"{_format_lakh(float(candidate['rent']))}/month "
+                                f"{_format_candidate_money(float(candidate['rent']), brand_profile)}/month "
                                 f"· {int(candidate['sqft']):,} sq. ft."
                             ).classes('text-[11px] muted')
                             ui.label(
@@ -1783,7 +1922,7 @@ async def outlet_intelligence_page() -> None:
                     'w-full items-start justify-between gap-3'
                 ):
                     with ui.column().classes('gap-0'):
-                        ui.label('India candidate map').classes(
+                        ui.label(f"{brand_profile['country']} candidate map").classes(
                             'text-lg font-bold'
                         )
                         ui.label(
@@ -1800,8 +1939,11 @@ async def outlet_intelligence_page() -> None:
                                 ui.label(label).classes('text-[10px] muted')
 
                 candidate_map = ui.leaflet(
-                    center=(22.7, 79.4),
-                    zoom=5,
+                    center=(
+                        float(brand_profile['map_center_lat']),
+                        float(brand_profile['map_center_lon']),
+                    ),
+                    zoom=int(brand_profile['map_zoom']),
                     options={
                         'scrollWheelZoom': True,
                         'zoomControl': True,

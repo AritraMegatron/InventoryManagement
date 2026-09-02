@@ -4,10 +4,18 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Any
 
-from nicegui import ui
+from nicegui import app, ui
 
 from app.ai_chat import AIChatController, create_ai_chat
 from app.company_context import PAGE_CONTEXTS
+from app.session_ui import require_brand_login, render_brand_session_controls
+from app.services.currency_service import format_money
+from app.services.network_service import build_command_center_snapshot
+from app.services.workflow_persistence_service import (
+    ensure_command_center_decisions,
+    save_command_center_decision,
+)
+from app.state.demo_state import get_brand_state
 
 from app.theme import apply_theme
 
@@ -16,77 +24,6 @@ PRIORITY_COLORS = {
     'HIGH': '#B33A3A',
     'MEDIUM': '#D99A1A',
 }
-
-
-EXECUTIVE_KPIS = [
-    {
-        'title': 'Monthly revenue',
-        'value': '₹12.8 crore',
-        'subtitle': 'Current network run rate',
-        'icon': 'payments',
-    },
-    {
-        'title': 'Next-month forecast',
-        'value': '₹13.4 crore',
-        'subtitle': '+4.8% projected growth',
-        'icon': 'trending_up',
-    },
-    {
-        'title': 'Operating profit',
-        'value': '₹2.3 crore',
-        'subtitle': '18.0% operating margin',
-        'icon': 'account_balance_wallet',
-    },
-    {
-        'title': 'Underperforming outlets',
-        'value': '9',
-        'subtitle': 'Across 63 active outlets',
-        'icon': 'storefront',
-    },
-    {
-        'title': 'Revenue at risk',
-        'value': '₹4.6 lakh',
-        'subtitle': 'Top active operational risks',
-        'icon': 'warning',
-    },
-]
-
-
-ACTION_ITEMS = [
-    {
-        'id': 'noida_inventory',
-        'priority': 'HIGH',
-        'title': 'Noida inventory shortage',
-        'impact': '₹1.8 lakh sales at risk',
-        'action': 'Approve stock transfer',
-        'button': 'Approve transfer',
-        'icon': 'inventory_2',
-        'route': '/demand-inventory',
-        'approved_status': 'Approved · Transfer task created',
-    },
-    {
-        'id': 'indiranagar_margin',
-        'priority': 'HIGH',
-        'title': 'Indiranagar margin decline',
-        'impact': '₹1.1 lakh monthly profit at risk',
-        'action': 'Start outlet recovery review',
-        'button': 'Start review',
-        'icon': 'storefront',
-        'route': '/network-intelligence',
-        'approved_status': 'Assigned · Recovery review started',
-    },
-    {
-        'id': 'protein_shake_pilot',
-        'priority': 'MEDIUM',
-        'title': 'High-Protein Chocolate Shake',
-        'impact': '89 / 100 product opportunity score',
-        'action': 'Approve six-outlet pilot',
-        'button': 'Approve pilot',
-        'icon': 'science',
-        'route': '/product-innovation',
-        'approved_status': 'Approved · Pilot brief created',
-    },
-]
 
 
 def _nav_item(
@@ -285,6 +222,8 @@ def _render_shell(ai_chat: AIChatController) -> None:
         with ui.row().classes(
             'items-center gap-3'
         ):
+            render_brand_session_controls()
+
             ui.badge(
                 'EXECUTIVE VIEW',
                 color='secondary',
@@ -349,6 +288,51 @@ def _metric_card(
 
 @ui.page('/command-center')
 def command_center_page() -> None:
+    profile = require_brand_login()
+    if profile is None:
+        return
+
+    brand_state = get_brand_state(app.storage.user, profile['brand_id'])
+    command_snapshot = build_command_center_snapshot(
+        brand_state['network']['outlets'],
+        profile,
+    )
+    summary = command_snapshot['summary']
+    action_items = command_snapshot['actions']
+
+    executive_kpis = [
+        {
+            'title': 'Monthly revenue',
+            'value': format_money(summary['monthly_revenue'], profile),
+            'subtitle': 'Current network run rate',
+            'icon': 'payments',
+        },
+        {
+            'title': 'Next-month forecast',
+            'value': format_money(summary['next_month_revenue'], profile),
+            'subtitle': f"{summary['forecast_growth_pct']:+.1f}% projected growth",
+            'icon': 'trending_up',
+        },
+        {
+            'title': 'Operating profit',
+            'value': format_money(summary['operating_profit'], profile),
+            'subtitle': f"{summary['operating_margin_pct']:.1f}% operating margin",
+            'icon': 'account_balance_wallet',
+        },
+        {
+            'title': 'Underperforming outlets',
+            'value': str(summary['underperforming_count']),
+            'subtitle': f"Across {summary['outlet_count']} active outlets",
+            'icon': 'storefront',
+        },
+        {
+            'title': 'Revenue at risk',
+            'value': format_money(command_snapshot['revenue_at_risk'], profile),
+            'subtitle': 'Top active operational risks',
+            'icon': 'warning',
+        },
+    ]
+
     apply_theme()
 
     ui.add_css(
@@ -380,11 +364,12 @@ def command_center_page() -> None:
     )
     _render_shell(ai_chat)
 
+    decision_state = ensure_command_center_decisions(
+        brand_state,
+        action_items,
+    )
     state: dict[str, Any] = {
-        'statuses': {
-            item['id']: 'Awaiting decision'
-            for item in ACTION_ITEMS
-        },
+        'statuses': decision_state['statuses'],
     }
 
     refs: dict[str, Any] = {
@@ -420,12 +405,16 @@ def command_center_page() -> None:
     ) -> None:
         item = next(
             action
-            for action in ACTION_ITEMS
+            for action in action_items
             if action['id'] == action_id
         )
 
-        state['statuses'][action_id] = (
-            item['approved_status']
+        state['statuses'][action_id] = item['approved_status']
+        save_command_center_decision(
+            brand_state,
+            action_id=action_id,
+            status=item['approved_status'],
+            action_items=action_items,
         )
 
         refs['status_labels'][action_id].set_text(
@@ -509,7 +498,7 @@ def command_center_page() -> None:
             'max-[800px]:grid-cols-2 '
             'max-[520px]:grid-cols-1'
         ):
-            for kpi in EXECUTIVE_KPIS:
+            for kpi in executive_kpis:
                 _metric_card(
                     kpi['title'],
                     kpi['value'],
@@ -542,12 +531,16 @@ def command_center_page() -> None:
                         'text-amber-200 text-xl'
                     )
 
+                lead_risk = action_items[0]['title'] if action_items else 'No active risk'
+                product_action = action_items[2]['title'] if len(action_items) > 2 else 'A product concept'
                 ui.label(
-                    'Revenue is projected to grow 4.8% next month. '
-                    'Nine outlets are underperforming, while the most '
-                    'immediate operational risk is a Noida inventory '
-                    'shortage. One product concept is ready for an '
-                    'executive pilot decision.'
+                    f"{profile['short_name']} is projected to "
+                    f"{('grow' if summary['forecast_growth_pct'] >= 0 else 'decline')} "
+                    f"{abs(summary['forecast_growth_pct']):.1f}% next month. "
+                    f"{summary['underperforming_count']} of "
+                    f"{summary['outlet_count']} outlets are underperforming. "
+                    f"The highest current operational alert is {lead_risk.lower()}, "
+                    f"and {product_action} is ready for a pilot decision."
                 ).classes(
                     'text-lg md:text-xl font-semibold '
                     'leading-relaxed text-white/90 mt-4'
@@ -603,7 +596,7 @@ def command_center_page() -> None:
             'w-full gap-4 '
             'max-[1100px]:grid-cols-1'
         ):
-            for item in ACTION_ITEMS:
+            for item in action_items:
                 with ui.card().classes(
                     'executive-action-card w-full p-5'
                 ) as action_card:
@@ -673,12 +666,19 @@ def command_center_page() -> None:
                         'text-sm font-semibold mt-1'
                     )
 
+                    current_status = state['statuses'][item['id']]
+                    is_approved = current_status != 'Awaiting decision'
+
                     refs['status_labels'][
                         item['id']
                     ] = ui.label(
-                        'Awaiting decision'
+                        current_status
                     ).classes(
-                        'text-xs muted mt-3'
+                        (
+                            'text-xs font-semibold text-positive mt-3'
+                            if is_approved
+                            else 'text-xs muted mt-3'
+                        )
                     )
 
                     refs['action_buttons'][
@@ -694,6 +694,12 @@ def command_center_page() -> None:
                     ).classes(
                         'w-full rounded-xl mt-4'
                     )
+
+                    if is_approved:
+                        refs['action_buttons'][item['id']].disable()
+                        action_card.classes(add='executive-action-card-approved')
+
+        update_pending_count()
 
         ui.label(
             'Prototype only · Financial values and actions are simulated.'

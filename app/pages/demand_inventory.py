@@ -4,20 +4,34 @@ from copy import deepcopy
 import asyncio
 from typing import Any
 
-from nicegui import ui
+from nicegui import app, ui
 
 from app.ai_chat import AIChatController, create_ai_chat
 from app.company_context import PAGE_CONTEXTS
+from app.session_ui import require_brand_login, render_brand_session_controls
 
-from app.mock_data import (
-    OUTLETS,
-    REGIONS,
+from app.services.demand_inventory_service import (
+    advance_forecast_run,
+    advance_planning_run,
     build_dashboard_snapshot,
     build_inventory_planning_data,
     build_plan_summary,
-    format_inr,
+    default_demand_selection,
+    ensure_usable_stock,
+    format_demand_money,
+    get_demand_outlet,
+    get_demand_regions,
     outlets_for_region,
 )
+from app.services.workflow_persistence_service import (
+    approve_replenishment_plan,
+    clear_demand_action_workflow,
+    clear_generated_replenishment_plan,
+    ensure_demand_inventory_workspace,
+    save_generated_replenishment_plan,
+    save_inventory_rows,
+)
+from app.state.demo_state import get_brand_state
 from app.theme import (
     BURGUNDY,
     GOLD,
@@ -260,8 +274,11 @@ def _risk_chart_options(
         for row in rows
     ]
 
-    on_hand = [
-        row['on_hand']
+    usable_stock = [
+        row.get(
+            'usable_stock',
+            max(0, int(row['on_hand']) - int(row['safety_stock'])),
+        )
         for row in rows
     ]
 
@@ -275,7 +292,7 @@ def _risk_chart_options(
         'legend': {
             'data': [
                 f'Next {horizon} days demand',
-                'On hand',
+                'Usable stock',
             ],
             'bottom': 0,
             'textStyle': {
@@ -329,9 +346,9 @@ def _risk_chart_options(
                 },
             },
             {
-                'name': 'On hand',
+                'name': 'Usable stock',
                 'type': 'bar',
-                'data': on_hand,
+                'data': usable_stock,
                 'barWidth': 9,
                 'itemStyle': {
                     'color': GOLD,
@@ -595,6 +612,8 @@ def _render_shell(ai_chat: AIChatController) -> None:
         with ui.row().classes(
             'items-center gap-3'
         ):
+            render_brand_session_controls()
+
             ui.badge(
                 'CONCEPT DATA',
                 color='secondary',
@@ -619,6 +638,34 @@ def _render_shell(ai_chat: AIChatController) -> None:
 
 @ui.page('/demand-inventory')
 def demand_inventory_page() -> None:
+    profile = require_brand_login()
+    if profile is None:
+        return
+
+    brand_state = get_brand_state(
+        app.storage.user,
+        profile['brand_id'],
+    )
+    regions = get_demand_regions(brand_state)
+    default_region, default_outlet_id = default_demand_selection(brand_state)
+    workflow_state = ensure_demand_inventory_workspace(
+        brand_state,
+        default_region=default_region,
+        default_outlet_id=default_outlet_id,
+    )
+
+    persisted_region = str(workflow_state.get('region', default_region))
+    if persisted_region not in regions:
+        persisted_region = default_region
+
+    persisted_outlet_options = outlets_for_region(brand_state, persisted_region)
+    persisted_outlet_id = str(workflow_state.get('outlet_id', default_outlet_id))
+    if persisted_outlet_id not in persisted_outlet_options:
+        persisted_outlet_id = next(iter(persisted_outlet_options))
+
+    workflow_state['region'] = persisted_region
+    workflow_state['outlet_id'] = persisted_outlet_id
+
     apply_theme()
     ai_chat = create_ai_chat(
         page_name='Demand & Inventory',
@@ -628,27 +675,32 @@ def demand_inventory_page() -> None:
 
 
     state: dict[str, Any] = {
-        'region': 'Delhi NCR',
-        'outlet_id': 'dlf_noida',
-        'horizon': 7,
-        'planning_horizon': 7,
-        'run_number': 0,
-        'inventory_built': False,
-        'plan_generated': False,
-        'plan_approved': False,
+        'region': persisted_region,
+        'outlet_id': persisted_outlet_id,
+        'horizon': int(workflow_state.get('forecast_horizon', 7)),
+        'planning_horizon': int(workflow_state.get('planning_horizon', 7)),
+        'forecast_run_number': int(workflow_state.get('forecast_run_number', 0)),
+        'planning_run_number': int(workflow_state.get('planning_run_number', 0)),
+        'inventory_built': bool(workflow_state.get('inventory_built', False)),
+        'plan_generated': bool(workflow_state.get('plan_generated', False)),
+        'plan_approved': bool(workflow_state.get('plan_approved', False)),
         'selected_inventory_row_id': None,
     }
 
     snapshot = build_dashboard_snapshot(
+        brand_state=brand_state,
         outlet_id=state['outlet_id'],
         horizon=state['horizon'],
-        run_number=state['run_number'],
+        run_number=state['forecast_run_number'],
     )
 
-    planning_data = build_inventory_planning_data(
-        outlet_id=state['outlet_id'],
-        horizon=state['planning_horizon'],
-        run_number=state['run_number'],
+    planning_data = ensure_usable_stock(
+        build_inventory_planning_data(
+            brand_state=brand_state,
+            outlet_id=state['outlet_id'],
+            horizon=state['planning_horizon'],
+            run_number=state['planning_run_number'],
+        )
     )
 
     state['signal_labels'] = {
@@ -666,6 +718,7 @@ def demand_inventory_page() -> None:
         """Create a snapshot with three signals different from the current set."""
 
         new_snapshot = build_dashboard_snapshot(
+            brand_state=brand_state,
             outlet_id=outlet_id,
             horizon=horizon,
             run_number=run_number,
@@ -800,6 +853,7 @@ def demand_inventory_page() -> None:
                         )
 
     def clear_action_workflow() -> None:
+        clear_demand_action_workflow(brand_state)
         state['inventory_built'] = False
         state['plan_generated'] = False
         state['plan_approved'] = False
@@ -825,10 +879,13 @@ def demand_inventory_page() -> None:
     def update_planning_view() -> None:
         nonlocal planning_data
 
-        planning_data = build_inventory_planning_data(
-            outlet_id=state['outlet_id'],
-            horizon=state['planning_horizon'],
-            run_number=state['run_number'],
+        planning_data = ensure_usable_stock(
+            build_inventory_planning_data(
+                brand_state=brand_state,
+                outlet_id=state['outlet_id'],
+                horizon=state['planning_horizon'],
+                run_number=state['planning_run_number'],
+            )
         )
 
         _replace_echart_options(
@@ -870,8 +927,9 @@ def demand_inventory_page() -> None:
             str(planning_data['at_risk_count'])
         )
         refs['avoidable_waste'].set_text(
-            format_inr(
-                planning_data['avoidable_waste']
+            format_demand_money(
+                planning_data['avoidable_waste'],
+                profile,
             )
         )
 
@@ -894,12 +952,12 @@ def demand_inventory_page() -> None:
 
         await asyncio.sleep(0.85)
 
-        state['run_number'] += 1
+        state['forecast_run_number'] = advance_forecast_run(brand_state)
 
         new_snapshot = create_snapshot(
             outlet_id=state['outlet_id'],
             horizon=state['horizon'],
-            run_number=state['run_number'],
+            run_number=state['forecast_run_number'],
         )
 
         apply_snapshot(new_snapshot)
@@ -945,8 +1003,9 @@ def demand_inventory_page() -> None:
         )
 
         refs['expected_revenue'].set_text(
-            format_inr(
-                kpis['expected_revenue']
+            format_demand_money(
+                kpis['expected_revenue'],
+                profile,
             )
         )
 
@@ -963,7 +1022,6 @@ def demand_inventory_page() -> None:
             snapshot['signals']
         )
 
-        update_planning_view()
 
     def clear_demand_forecast_chart() -> None:
         """Clear only the plotted demand series while keeping the card intact."""
@@ -994,9 +1052,11 @@ def demand_inventory_page() -> None:
         event: Any,
     ) -> None:
         state['region'] = event.value
+        workflow_state['region'] = state['region']
 
         options = outlets_for_region(
-            state['region']
+            brand_state,
+            state['region'],
         )
 
         refs['outlet_select'].options = options
@@ -1027,20 +1087,21 @@ def demand_inventory_page() -> None:
         outlet_id: str,
     ) -> None:
         state['outlet_id'] = outlet_id
-        state['run_number'] += 1
+        workflow_state['outlet_id'] = outlet_id
 
+        state['forecast_run_number'] = advance_forecast_run(brand_state)
         new_snapshot = create_snapshot(
             outlet_id=outlet_id,
             horizon=state['horizon'],
-            run_number=state['run_number'],
+            run_number=state['forecast_run_number'],
         )
+        apply_snapshot(new_snapshot)
 
-        apply_snapshot(
-            new_snapshot
-        )
+        state['planning_run_number'] = advance_planning_run(brand_state)
+        update_planning_view()
 
         ui.notify(
-            f"Loaded {OUTLETS[outlet_id].name}",
+            f"Loaded {get_demand_outlet(brand_state, outlet_id).name}",
             type='info',
             position='top',
         )
@@ -1051,13 +1112,14 @@ def demand_inventory_page() -> None:
         state['horizon'] = int(
             event.value
         )
+        workflow_state['forecast_horizon'] = state['horizon']
 
-        state['run_number'] += 1
+        state['forecast_run_number'] = advance_forecast_run(brand_state)
 
         new_snapshot = create_snapshot(
             outlet_id=state['outlet_id'],
             horizon=state['horizon'],
-            run_number=state['run_number'],
+            run_number=state['forecast_run_number'],
         )
 
         apply_snapshot(
@@ -1070,6 +1132,8 @@ def demand_inventory_page() -> None:
         state['planning_horizon'] = int(
             event.value
         )
+        workflow_state['planning_horizon'] = state['planning_horizon']
+        state['planning_run_number'] = advance_planning_run(brand_state)
 
         update_planning_view()
 
@@ -1101,6 +1165,8 @@ def demand_inventory_page() -> None:
         refs['inventory_table'].rows = rows
         refs['inventory_table'].update()
 
+        save_inventory_rows(brand_state, rows)
+        clear_generated_replenishment_plan(brand_state)
         state['inventory_built'] = True
         state['plan_generated'] = False
         state['plan_approved'] = False
@@ -1365,6 +1431,8 @@ def demand_inventory_page() -> None:
         refs['inventory_table'].update()
         refs['action_dialog'].close()
 
+        save_inventory_rows(brand_state, refs['inventory_table'].rows)
+        clear_generated_replenishment_plan(brand_state)
         state['plan_generated'] = False
         state['plan_approved'] = False
 
@@ -1402,6 +1470,7 @@ def demand_inventory_page() -> None:
         await asyncio.sleep(0.55)
 
         plan_rows = build_plan_summary(
+            brand_state=brand_state,
             outlet_id=state['outlet_id'],
             inventory_rows=refs['inventory_table'].rows,
         )
@@ -1417,6 +1486,11 @@ def demand_inventory_page() -> None:
 
         state['plan_generated'] = ready_count > 0
         state['plan_approved'] = False
+        save_generated_replenishment_plan(
+            brand_state,
+            outlet_id=state['outlet_id'],
+            plan_rows=plan_rows,
+        )
 
         total_plan_cost = sum(
             float(row.get('total_cost_value', 0))
@@ -1433,7 +1507,7 @@ def demand_inventory_page() -> None:
         refs['plan_status'].set_text(
             (
                 f'{ready_count} coordinated {plan_word} · '
-                f'{format_inr(total_plan_cost)} total cost · '
+                f'{format_demand_money(total_plan_cost, profile)} total cost · '
                 f'click a row for details'
                 if ready_count
                 else 'No procurement or transfer actions were selected'
@@ -1857,12 +1931,10 @@ def demand_inventory_page() -> None:
         refs['approve_dialog'].open()
 
     def approve_plan() -> None:
+        approved_rows = approve_replenishment_plan(brand_state)
         state['plan_approved'] = True
-
-        for row in refs['plan_table'].rows:
-            if row['status'] == 'Ready for approval':
-                row['status'] = 'Approved'
-
+        state['plan_generated'] = bool(approved_rows)
+        refs['plan_table'].rows = deepcopy(approved_rows)
         refs['plan_table'].update()
 
         refs['plan_status'].set_text(
@@ -2262,7 +2334,7 @@ def demand_inventory_page() -> None:
             'action-bar w-full p-3 gap-3 items-center'
         ):
             refs['region_select'] = ui.select(
-                REGIONS,
+                regions,
                 value=state['region'],
                 label='Region',
                 on_change=on_region_change,
@@ -2274,7 +2346,8 @@ def demand_inventory_page() -> None:
 
             refs['outlet_select'] = ui.select(
                 outlets_for_region(
-                    state['region']
+                    brand_state,
+                    state['region'],
                 ),
                 value=state['outlet_id'],
                 label='Outlet',
@@ -2344,11 +2417,12 @@ def demand_inventory_page() -> None:
                 refs['expected_revenue_sub'],
             ) = _metric_card(
                 'Expected revenue',
-                format_inr(
-                    snapshot['kpis']['expected_revenue']
+                format_demand_money(
+                    snapshot['kpis']['expected_revenue'],
+                    profile,
                 ),
                 'Forecast gross sales',
-                'currency_rupee',
+                'payments',
             )
 
             (
@@ -2378,8 +2452,9 @@ def demand_inventory_page() -> None:
                 refs['avoidable_waste_sub'],
             ) = _metric_card(
                 'Avoidable waste',
-                format_inr(
-                    planning_data['avoidable_waste']
+                format_demand_money(
+                    planning_data['avoidable_waste'],
+                    profile,
                 ),
                 'Potential waste avoided',
                 'compost',
@@ -2682,8 +2757,17 @@ def demand_inventory_page() -> None:
                         'text-lg font-bold'
                     )
 
+                    persisted_inventory_rows = deepcopy(
+                        workflow_state.get('inventory_rows', [])
+                    )
+                    inventory_status_text = (
+                        f"{len(persisted_inventory_rows)} products loaded for the next "
+                        f"{state['planning_horizon']} days. Click a row to record an action."
+                        if state['inventory_built'] and persisted_inventory_rows
+                        else 'Build the action plan to load the latest inventory position.'
+                    )
                     refs['inventory_status'] = ui.label(
-                        'Build the action plan to load the latest inventory position.'
+                        inventory_status_text
                     ).classes(
                         'text-xs muted'
                     )
@@ -2715,11 +2799,12 @@ def demand_inventory_page() -> None:
                         'rounded-xl'
                     )
 
-                    refs['generate_plan_button'].disable()
+                    if not state['inventory_built']:
+                        refs['generate_plan_button'].disable()
 
             refs['inventory_table'] = ui.table(
                 columns=INVENTORY_COLUMNS,
-                rows=[],
+                rows=deepcopy(workflow_state.get('inventory_rows', [])),
                 row_key='id',
                 pagination={
                     'rowsPerPage': 7,
@@ -2757,8 +2842,34 @@ def demand_inventory_page() -> None:
                         'text-lg font-bold'
                     )
 
+                    persisted_plan_rows = deepcopy(workflow_state.get('plan_rows', []))
+                    persisted_ready_count = sum(
+                        1 for row in persisted_plan_rows
+                        if row.get('status') == 'Ready for approval'
+                    )
+                    persisted_approved_count = sum(
+                        1 for row in persisted_plan_rows
+                        if row.get('status') == 'Approved'
+                    )
+                    if state['plan_approved'] and persisted_approved_count:
+                        plan_status_text = 'Approved · Purchase orders and dispatch tasks created'
+                    elif state['plan_generated'] and persisted_ready_count:
+                        persisted_total_cost = sum(
+                            float(row.get('total_cost_value', 0))
+                            for row in persisted_plan_rows
+                            if row.get('status') == 'Ready for approval'
+                        )
+                        plan_word = 'plan' if persisted_ready_count == 1 else 'plans'
+                        plan_status_text = (
+                            f"{persisted_ready_count} coordinated {plan_word} · "
+                            f"{format_demand_money(persisted_total_cost, profile)} total cost · "
+                            'click a row for details'
+                        )
+                    else:
+                        plan_status_text = 'No plan generated'
+
                     refs['plan_status'] = ui.label(
-                        'No plan generated'
+                        plan_status_text
                     ).classes(
                         'text-xs muted'
                     )
@@ -2773,11 +2884,12 @@ def demand_inventory_page() -> None:
                     'rounded-xl'
                 )
 
-                refs['approve_button'].disable()
+                if not (state['plan_generated'] and not state['plan_approved']):
+                    refs['approve_button'].disable()
 
             refs['plan_table'] = ui.table(
                 columns=PLAN_COLUMNS,
-                rows=[],
+                rows=deepcopy(workflow_state.get('plan_rows', [])),
                 row_key='id',
                 pagination={
                     'rowsPerPage': 2,
