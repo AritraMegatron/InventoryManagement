@@ -23,6 +23,7 @@ from app.services.demand_inventory_service import (
     get_demand_regions,
     outlets_for_region,
 )
+from app.services.ingredient_planning_service import build_ingredient_equivalent_rows
 from app.services.workflow_persistence_service import (
     approve_replenishment_plan,
     clear_demand_action_workflow,
@@ -359,6 +360,23 @@ def _risk_chart_options(
     }
 
 
+def _ingredient_chart_options(rows: list[dict[str, Any]], horizon: int) -> dict[str, Any]:
+    # Each category states its unit: litres, kilograms, or packaging count.
+    options = _risk_chart_options({'horizon': horizon, 'inventory_rows': [
+        {'product': f"{r['ingredient']} ({r['unit']})", 'forecast': r['demand_equivalent'],
+         'on_hand': r['usable_stock_equivalent'], 'safety_stock': 0,
+         'usable_stock': r['usable_stock_equivalent']}
+        for r in rows
+    ]})
+    demand_label = f'Next {horizon} days demand'
+    options['legend']['data'] = [demand_label, 'Usable stock equivalent']
+    options['series'][0]['name'] = demand_label
+    options['series'][1]['name'] = 'Usable stock equivalent'
+    options['grid']['left'] = 185
+    options['yAxis']['axisLabel']['width'] = 170
+    return options
+
+
 def _replace_echart_options(
     chart: Any,
     new_options: dict[str, Any],
@@ -684,6 +702,7 @@ def demand_inventory_page() -> None:
         'inventory_built': bool(workflow_state.get('inventory_built', False)),
         'plan_generated': bool(workflow_state.get('plan_generated', False)),
         'plan_approved': bool(workflow_state.get('plan_approved', False)),
+        'ingredient_view': False,
         'selected_inventory_row_id': None,
     }
 
@@ -876,6 +895,28 @@ def demand_inventory_page() -> None:
         refs['generate_plan_button'].disable()
         refs['approve_button'].disable()
 
+    def refresh_availability_chart() -> None:
+        ingredient_view = state['ingredient_view']
+        ingredients = build_ingredient_equivalent_rows(
+            brand_state, planning_data['inventory_rows'],
+        )
+        options = (_ingredient_chart_options(ingredients, state['planning_horizon'])
+                   if ingredient_view else _risk_chart_options(planning_data))
+        height = max(360, len(ingredients) * 42 + 100) if ingredient_view else 360
+        refs['risk_chart'].style(f'height: {height}px; min-height: {height}px')
+        _replace_echart_options(refs['risk_chart'], options)
+        refs['availability_title'].set_text(
+            'Ingredient availability vs demand' if ingredient_view
+            else 'Product availability vs demand')
+        refs['planning_subtitle'].set_text(
+            f"Next {state['planning_horizon']} days · BOM equivalents of item demand and usable stock"
+            if ingredient_view else
+            f"Next {state['planning_horizon']} days demand compared with current usable stock")
+
+    def toggle_availability(event: Any) -> None:
+        state['ingredient_view'] = bool(event.value)
+        refresh_availability_chart()
+
     def update_planning_view() -> None:
         nonlocal planning_data
 
@@ -938,6 +979,7 @@ def demand_inventory_page() -> None:
         )
 
         clear_action_workflow()
+        refresh_availability_chart()
 
     async def run_forecast() -> None:
         refs['run_button'].disable()
@@ -1162,11 +1204,17 @@ def demand_inventory_page() -> None:
             planning_data['inventory_rows']
         )
 
+        for row in rows:
+            quantity = max(0, int(row['forecast']) - int(row['on_hand']))
+            row['action_type'] = 'Order' if quantity else ''
+            row['action_quantity'] = quantity
+            row['action_taken'] = f'Produce {quantity} units · net ingredient procurement' if quantity else 'No action'
         refs['inventory_table'].rows = rows
         refs['inventory_table'].update()
 
         save_inventory_rows(brand_state, rows)
         clear_generated_replenishment_plan(brand_state)
+        refresh_availability_chart()
         state['inventory_built'] = True
         state['plan_generated'] = False
         state['plan_approved'] = False
@@ -1174,7 +1222,7 @@ def demand_inventory_page() -> None:
         refs['inventory_status'].set_text(
             f"{len(rows)} products loaded for the next "
             f"{state['planning_horizon']} days. "
-            f"Click a row to record an action."
+            f"Production quantities prefilled; click a row to adjust or transfer."
         )
 
         refs['plan_table'].rows = []
@@ -1342,9 +1390,7 @@ def demand_inventory_page() -> None:
 
         refs['action_mode'].value = mode
         refs['action_quantity'].value = int(
-            row.get('action_quantity')
-            or row.get('recommended_qty')
-            or 0
+            row.get('action_quantity', max(0, int(row['forecast']) - int(row['on_hand'])))
         )
 
         source_options = row.get(
@@ -1392,7 +1438,7 @@ def demand_inventory_page() -> None:
             row['action_quantity'] = quantity
             row['transfer_source'] = ''
             row['action_taken'] = (
-                f'Procure {quantity} units'
+                f'Produce {quantity} units · net ingredient procurement'
             )
         else:
             source = refs['action_source'].value
@@ -1428,10 +1474,12 @@ def demand_inventory_page() -> None:
                 f'Transfer {quantity} units from {source}'
             )
 
+        row['production_override'] = mode == 'Order' or quantity <= 0
         refs['inventory_table'].update()
         refs['action_dialog'].close()
 
         save_inventory_rows(brand_state, refs['inventory_table'].rows)
+        refresh_availability_chart()
         clear_generated_replenishment_plan(brand_state)
         state['plan_generated'] = False
         state['plan_approved'] = False
@@ -1734,9 +1782,13 @@ def demand_inventory_page() -> None:
                                 'field': 'item',
                                 'align': 'left',
                             },
+                            {'name': 'required_quantity', 'label': 'Required',
+                             'field': 'required_quantity', 'align': 'right'},
+                            {'name': 'on_hand_quantity', 'label': 'On hand',
+                             'field': 'on_hand_quantity', 'align': 'right'},
                             {
                                 'name': 'quantity',
-                                'label': 'Qty',
+                                'label': 'Order qty',
                                 'field': 'quantity',
                                 'align': 'right',
                             },
@@ -1938,7 +1990,7 @@ def demand_inventory_page() -> None:
         refs['plan_table'].update()
 
         refs['plan_status'].set_text(
-            'Approved · Purchase orders and dispatch tasks created'
+            'Approved · Ingredients ordered (awaiting receipt); transfers awaiting dispatch'
         )
 
         refs['approve_dialog'].close()
@@ -2660,7 +2712,7 @@ def demand_inventory_page() -> None:
                     with ui.column().classes(
                         'gap-0'
                     ):
-                        ui.label(
+                        refs['availability_title'] = ui.label(
                             'Product availability vs demand'
                         ).classes(
                             'text-lg font-bold'
@@ -2671,6 +2723,9 @@ def demand_inventory_page() -> None:
                             f"compared with current usable stock"
                         ).classes(
                             'text-xs muted'
+                        ).tooltip(
+                            'Ingredient view converts item demand and usable finished-item stock through the BOM. '
+                            'Stock equivalent is not raw ingredient inventory; purchase orders separately deduct raw stock.'
                         )
 
                     with ui.row().classes(
@@ -2690,20 +2745,19 @@ def demand_inventory_page() -> None:
                             'w-40'
                         )
 
-                        ui.badge(
-                            'OUTLET LEVEL',
-                            color='primary',
-                        ).props(
-                            'outline'
-                        )
+                        with ui.row().classes('items-center gap-0'):
+                            ui.label('Items').classes('text-xs muted')
+                            ui.switch(value=False, on_change=toggle_availability).props(
+                                'dense color=primary size=sm aria-label="Show ingredients"'
+                            ).tooltip('Switch between item and ingredient availability')
+                            ui.label('Ingredients').classes('text-xs muted')
 
-                refs['risk_chart'] = ui.echart(
-                    _risk_chart_options(
-                        planning_data
-                    )
-                ).classes(
-                    'w-full h-[360px] mt-2'
-                )
+                with ui.element('div').classes('w-full mt-2').style(
+                    'height: 360px; min-height: 360px; max-height: 360px; overflow-y: auto; overflow-x: hidden'
+                ):
+                    refs['risk_chart'] = ui.echart(
+                        _risk_chart_options(planning_data)
+                    ).classes('w-full').style('height: 360px; min-height: 360px')
 
             with ui.card().classes(
                 'surface col-span-5 p-5 w-full '
@@ -2852,7 +2906,7 @@ def demand_inventory_page() -> None:
                         if row.get('status') == 'Approved'
                     )
                     if state['plan_approved'] and persisted_approved_count:
-                        plan_status_text = 'Approved · Purchase orders and dispatch tasks created'
+                        plan_status_text = 'Approved · Ingredients ordered (awaiting receipt); transfers awaiting dispatch'
                     elif state['plan_generated'] and persisted_ready_count:
                         persisted_total_cost = sum(
                             float(row.get('total_cost_value', 0))

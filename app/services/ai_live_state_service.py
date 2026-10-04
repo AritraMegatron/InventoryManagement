@@ -7,6 +7,7 @@ from typing import Any, Mapping
 
 from app.data.outlet_candidates import clone_default_candidates
 from app.services.currency_service import format_money
+from app.services.ingredient_planning_service import build_ingredient_rows, build_ingredient_equivalent_rows
 from app.services.demand_inventory_service import (
     build_dashboard_snapshot,
     build_inventory_planning_data,
@@ -271,6 +272,21 @@ def get_inventory_risks(brand_state: dict[str, Any]) -> dict[str, Any]:
         'forecast_kpis': deepcopy(forecast_snapshot.get('kpis', {})),
         'demand_signals': deepcopy(forecast_snapshot.get('signals', [])),
         'planning_risks': deepcopy(planning_snapshot.get('risks', [])),
+        'ingredient_chart_equivalents': build_ingredient_equivalent_rows(
+            brand_state, planning_snapshot['inventory_rows'],
+        ),
+        'ingredient_chart_rule': (
+            'The chart shows BOM equivalents of full item forecast and usable finished-item stock '
+            '(item on hand minus item safety stock). It does not show raw ingredient inventory. '
+            'The ingredient_availability field below is the separate raw-stock procurement calculation.'
+        ),
+        'ingredient_availability': build_ingredient_rows(brand_state, outlet_id, inventory_rows),
+        'ingredient_planning_rule': (
+            'Produce forecast minus actual finished-item on hand, adjusted by saved production '
+            'overrides or incoming finished-item transfers. Explode the shared BOM, then '
+            'procure required ingredients minus ingredient on hand. No ingredient safety buffer. '
+            'Approved ingredient purchases are ordered, not received.'
+        ),
         'inventory_actions_built': bool(workflow.get('inventory_built')),
         'inventory_actions': [
             {

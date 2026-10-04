@@ -17,6 +17,10 @@ from app.mock_data import (
     format_inr,
 )
 from app.services.currency_service import format_money
+from app.data.ingredient_bom import BOM_BY_BRAND
+from app.services.ingredient_planning_service import (
+    ensure_ingredient_stock, build_ingredient_rows, build_ingredient_purchase_lines,
+)
 
 
 @dataclass(frozen=True)
@@ -118,47 +122,7 @@ CANADA_VENDOR_DIRECTORY = {
 }
 
 
-CANADA_PRODUCT_RECIPES: dict[str, list[tuple[str, float, str, str, float]]] = {
-    'Maple Cream Cold Brew': [
-        ('Cold brew concentrate', 0.055, 'L', 'Ontario Roasting Co.', 12.50),
-        ('Cream', 0.070, 'L', 'Northern Dairy Supply', 3.20),
-        ('Maple syrup', 0.018, 'L', 'Maple Grove Ingredients', 15.00),
-        ('Cold cup + lid', 1.0, 'ea', 'Prairie Packaging', 0.28),
-    ],
-    'Salted Maple Latte': [
-        ('Espresso beans', 0.018, 'kg', 'Ontario Roasting Co.', 24.00),
-        ('Milk', 0.250, 'L', 'Northern Dairy Supply', 2.25),
-        ('Maple syrup', 0.022, 'L', 'Maple Grove Ingredients', 15.00),
-        ('Hot cup + lid', 1.0, 'ea', 'Prairie Packaging', 0.25),
-    ],
-    'Blueberry Oat Latte': [
-        ('Espresso beans', 0.018, 'kg', 'Ontario Roasting Co.', 24.00),
-        ('Oat beverage', 0.250, 'L', 'Northern Dairy Supply', 3.10),
-        ('Blueberry compote', 0.030, 'kg', 'Pacific Produce Supply', 10.50),
-        ('Hot cup + lid', 1.0, 'ea', 'Prairie Packaging', 0.25),
-    ],
-    'Vanilla Bean Frappe': [
-        ('Milk', 0.220, 'L', 'Northern Dairy Supply', 2.25),
-        ('Vanilla base', 0.045, 'L', 'Maple Grove Ingredients', 9.50),
-        ('Cold cup + lid', 1.0, 'ea', 'Prairie Packaging', 0.28),
-    ],
-    'Montreal Mocha': [
-        ('Espresso beans', 0.018, 'kg', 'Ontario Roasting Co.', 24.00),
-        ('Milk', 0.220, 'L', 'Northern Dairy Supply', 2.25),
-        ('Chocolate sauce', 0.030, 'L', 'Maple Grove Ingredients', 8.75),
-        ('Hot cup + lid', 1.0, 'ea', 'Prairie Packaging', 0.25),
-    ],
-    'Strawberry Yogurt Smoothie': [
-        ('Yogurt', 0.180, 'kg', 'Northern Dairy Supply', 5.50),
-        ('Strawberry puree', 0.090, 'kg', 'Pacific Produce Supply', 8.80),
-        ('Cold cup + lid', 1.0, 'ea', 'Prairie Packaging', 0.28),
-    ],
-    'Butter Tart Sundae': [
-        ('Vanilla soft serve base', 0.230, 'L', 'Northern Dairy Supply', 3.60),
-        ('Butter tart crumble', 0.060, 'kg', 'Maple Grove Ingredients', 11.00),
-        ('Dessert cup + spoon', 1.0, 'ea', 'Prairie Packaging', 0.31),
-    ],
-}
+CANADA_PRODUCT_RECIPES = BOM_BY_BRAND[CANADA_BRAND_ID]
 
 
 CANADA_TRANSFER_RESOURCES = [
@@ -490,7 +454,7 @@ def _canada_source_candidates(brand_state: dict[str, Any], outlet_id: str) -> li
     return (same_region + fallback)[:2]
 
 
-def build_inventory_planning_data(
+def _build_item_planning_data(
     brand_state: dict[str, Any],
     outlet_id: str,
     horizon: int,
@@ -741,7 +705,7 @@ def _canada_document_metadata(
     }
 
 
-def build_plan_summary(
+def _build_legacy_plan_summary(
     brand_state: dict[str, Any],
     outlet_id: str,
     inventory_rows: list[dict[str, Any]],
@@ -857,3 +821,49 @@ def build_plan_summary(
             **transfer_metadata,
         },
     ]
+
+
+def build_inventory_planning_data(
+    brand_state: dict[str, Any], outlet_id: str, horizon: int, run_number: int = 0,
+) -> dict[str, Any]:
+    planning = _build_item_planning_data(brand_state, outlet_id, horizon, run_number)
+    baseline = _build_item_planning_data(brand_state, outlet_id, 7, 0)
+    ensure_ingredient_stock(brand_state, outlet_id, baseline['inventory_rows'])
+    planning['ingredient_rows'] = build_ingredient_rows(
+        brand_state, outlet_id, planning['inventory_rows'],
+    )
+    return planning
+
+
+def build_plan_summary(
+    brand_state: dict[str, Any], outlet_id: str,
+    inventory_rows: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    # Reuse existing country-specific document headers and transfer logistics.
+    # Purchase lines are exclusively sourced from the same net BOM calculation
+    # used by the ingredient chart, never from gross legacy recipe quantities.
+    transfer_rows = deepcopy(inventory_rows)
+    for row in transfer_rows:
+        if row.get('action_type') == 'Order':
+            row['action_type'] = ''
+    plans = _build_legacy_plan_summary(brand_state, outlet_id, transfer_rows)
+    baseline = _build_item_planning_data(brand_state, outlet_id, 7, 0)
+    ensure_ingredient_stock(brand_state, outlet_id, baseline['inventory_rows'])
+    ingredients = build_ingredient_rows(brand_state, outlet_id, inventory_rows)
+    details = build_ingredient_purchase_lines(brand_state, ingredients)
+    profile = brand_state['profile']
+    for line in details:
+        line['cost'] = format_demand_money(line['cost_value'], profile)
+    purchase = next(plan for plan in plans if plan['plan_type'] == 'purchase')
+    cost = round(sum(line['cost_value'] for line in details), 2)
+    purchase.update({
+        'details': details, 'scope': _purchase_scope(details),
+        'source_summary': _source_summary([line['vendor'] for line in details]),
+        'total_cost_value': cost, 'cost': format_demand_money(cost, profile),
+        'status': 'Ready for approval' if details else 'No procurement needed',
+        'expected_completion': (date.today() + timedelta(days=2)).strftime('%d %b')
+            + ' · 10:00' if details else '—',
+        'calculation_basis': 'BOM for remaining production minus ingredient on hand; no ingredient safety stock',
+        'ingredient_snapshot': ingredients,
+    })
+    return plans

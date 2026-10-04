@@ -5,7 +5,7 @@ from typing import Any
 
 
 COMMAND_DECISION_VERSION = 1
-DEMAND_WORKSPACE_VERSION = 1
+DEMAND_WORKSPACE_VERSION = 2
 
 
 def ensure_command_center_decisions(
@@ -81,6 +81,9 @@ def ensure_demand_inventory_workspace(
     if workflow.get('workspace_version') != DEMAND_WORKSPACE_VERSION:
         preserved_forecast_run = int(workflow.get('forecast_run_number', 0) or 0)
         preserved_planning_run = int(workflow.get('planning_run_number', 0) or 0)
+        brand_state.setdefault('artifacts', {})['purchase_plans'] = []
+        brand_state.setdefault('artifacts', {})['transfer_plans'] = []
+        brand_state.setdefault('decisions', {})['demand_inventory'] = {}
         workflow.update(
             {
                 'workspace_version': DEMAND_WORKSPACE_VERSION,
@@ -186,6 +189,8 @@ def approve_replenishment_plan(brand_state: dict[str, Any]) -> list[dict[str, An
     for row in rows:
         if row.get('status') == 'Ready for approval':
             row['status'] = 'Approved'
+            row['fulfillment_status'] = ('Ordered · Awaiting receipt'
+                if row.get('plan_type') == 'purchase' else 'Awaiting dispatch')
 
     workflow['plan_rows'] = deepcopy(rows)
     workflow['plan_generated'] = bool(rows)
