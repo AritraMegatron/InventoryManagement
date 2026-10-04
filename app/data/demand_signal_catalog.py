@@ -74,3 +74,24 @@ for country in ('CA','IN'):
         ('local_offer','Neighbourhood café offer scenario',5,'all',(),(2,3,4)),
     ]:
         add(country.lower()+'_'+key,country,'commercial',label,ALL,impact,target,formats=formats,weekdays=days,icon='local_offer')
+
+# Additional India network cities: each has a plausible winter and event option.
+add('in_additional_north_winter', 'IN', 'weather',
+    'Cool winter days soften chilled-drink demand', (12, 1, 2), -7, 'cold',
+    ('Jaipur', 'Lucknow', 'Patna'), icon='thermostat')
+add('in_west_central_winter', 'IN', 'weather',
+    'Mild winter afternoons support café visits', (12, 1, 2), 4, 'all',
+    ('Mumbai', 'Ahmedabad', 'Surat', 'Indore', 'Nagpur', 'Kolkata', 'Bhubaneswar', 'Guwahati'),
+    icon='wb_sunny')
+add('in_south_winter', 'IN', 'weather',
+    'Comfortable afternoon weather supports café visits', (12, 1, 2), 4, 'all',
+    ('Bengaluru', 'Hyderabad', 'Chennai', 'Kochi', 'Coimbatore'), icon='wb_sunny')
+add('in_tamil_autumn_rain', 'IN', 'weather',
+    'Seasonal rain encourages delivery orders over walk-ins', (10, 11, 12), -5, 'all',
+    ('Chennai', 'Coimbatore'), icon='water_drop')
+for city in ('Mumbai', 'Bengaluru', 'Hyderabad', 'Chennai', 'Kolkata', 'Jaipur',
+             'Ahmedabad', 'Lucknow', 'Kochi', 'Indore', 'Bhubaneswar', 'Guwahati',
+             'Surat', 'Nagpur', 'Coimbatore', 'Patna'):
+    add('in_indoor_event_' + city.lower(), 'IN', 'event',
+        f'Indoor music event · {city}', ALL, 8, cities=(city,),
+        weekdays=(4, 5, 6), icon='music_note')

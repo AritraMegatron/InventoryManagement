@@ -9,15 +9,13 @@ from typing import Any
 
 from app.data.brand_catalog import CANADA_BRAND_ID, INDIA_BRAND_ID
 from app.mock_data import (
-    OUTLETS as INDIA_OUTLETS,
     PRODUCTS as INDIA_PRODUCTS,
-    REGIONS as INDIA_REGIONS,
-    build_dashboard_snapshot as build_india_dashboard_snapshot,
-    build_inventory_planning_data as build_india_inventory_planning_data,
-    build_plan_summary as build_india_plan_summary,
+    PROCUREMENT_MANAGERS as INDIA_PROCUREMENT_MANAGERS,
+    TRANSFER_RESOURCES as INDIA_TRANSFER_RESOURCES,
+    VENDOR_DIRECTORY as INDIA_VENDOR_DIRECTORY,
     format_inr,
 )
-from app.services.demand_dataset_service import get_demand_dataset, period_item_totals, daily_totals
+from app.services.demand_dataset_service import get_demand_dataset, period_item_totals, daily_totals, ensure_sales_inputs
 from app.services.currency_service import format_money
 from app.data.ingredient_bom import BOM_BY_BRAND
 from app.services.ingredient_planning_service import (
@@ -174,36 +172,36 @@ def format_demand_money(value: float, profile: dict[str, Any]) -> str:
     return format_money(value, profile, compact=False)
 
 
-def _canada_outlets(brand_state: dict[str, Any]) -> dict[str, DemandOutlet]:
+def _network_outlets(brand_state: dict[str, Any]) -> dict[str, DemandOutlet]:
     result: dict[str, DemandOutlet] = {}
+    inputs = ensure_sales_inputs(brand_state, _products(brand_state))
     for row in brand_state['network']['outlets']:
-        daily_orders = max(90, int(round(float(row['monthly_orders']) / 30)))
+        source = inputs[str(row['store_id'])]
         result[str(row['store_id'])] = DemandOutlet(
             outlet_id=str(row['store_id']),
             name=str(row['outlet']),
             city=str(row['city']),
             region=str(row['region']),
             outlet_format=str(row['format']),
-            daily_baseline=daily_orders,
+            daily_baseline=source['daily_item_baseline'],
             delivery_share=int(row['delivery_share_pct']),
             cluster=str(row['city']),
-            average_ticket=float(row['average_ticket']),
+            average_ticket=float(source['average_ticket']),
         )
     return result
 
 
+def _products(brand_state):
+    return INDIA_PRODUCTS if brand_state['brand_id'] == INDIA_BRAND_ID else CANADA_PRODUCTS
+
+
 def get_demand_outlets(brand_state: dict[str, Any]) -> dict[str, Any]:
-    brand_id = brand_state['brand_id']
-    if brand_id == INDIA_BRAND_ID:
-        return INDIA_OUTLETS
-    if brand_id == CANADA_BRAND_ID:
-        return _canada_outlets(brand_state)
-    raise KeyError(f'Unsupported demo brand: {brand_id}')
+    if brand_state['brand_id'] not in (INDIA_BRAND_ID, CANADA_BRAND_ID):
+        raise KeyError(f"Unsupported demo brand: {brand_state['brand_id']}")
+    return _network_outlets(brand_state)
 
 
 def get_demand_regions(brand_state: dict[str, Any]) -> list[str]:
-    if brand_state['brand_id'] == INDIA_BRAND_ID:
-        return list(INDIA_REGIONS)
     outlets = get_demand_outlets(brand_state)
     return ['All regions', *sorted({outlet.region for outlet in outlets.values()})]
 
@@ -218,7 +216,7 @@ def outlets_for_region(brand_state: dict[str, Any], region: str) -> dict[str, st
 
 def default_demand_selection(brand_state: dict[str, Any]) -> tuple[str, str]:
     if brand_state['brand_id'] == INDIA_BRAND_ID:
-        return 'Delhi NCR', 'dlf_noida'
+        return 'Delhi NCR', 'noida-1'
 
     regions = get_demand_regions(brand_state)
     default_region = 'Ontario' if 'Ontario' in regions else regions[1]
@@ -265,17 +263,10 @@ def _build_legacy_dashboard_snapshot(
 ) -> dict[str, Any]:
     """Build one tenant-aware demand snapshot."""
 
-    if brand_state['brand_id'] == INDIA_BRAND_ID:
-        return build_india_dashboard_snapshot(
-            outlet_id=outlet_id,
-            horizon=horizon,
-            run_number=run_number,
-            excluded_signal_labels=excluded_signal_labels,
-        )
-
+    products = _products(brand_state)
     profile = brand_state['profile']
     outlet = get_demand_outlet(brand_state, outlet_id)
-    rng = random.Random(_stable_seed(f'canada:{outlet_id}:{horizon}:{run_number}'))
+    rng = random.Random(_stable_seed(f"{'canada' if brand_state['brand_id'] == CANADA_BRAND_ID else 'india'}:{outlet_id}:{horizon}:{run_number}"))
 
     history_days = 7
     categories: list[str] = []
@@ -325,13 +316,13 @@ def _build_legacy_dashboard_snapshot(
     at_risk_count = 0
     projected_waste_value = 0.0
 
-    for index, product in enumerate(CANADA_PRODUCTS):
+    for index, product in enumerate(products):
         product_forecast = max(12, int(tomorrow_total * product['share'] * rng.uniform(0.92, 1.08)))
         safety_stock = max(5, int(product_forecast * rng.uniform(0.14, 0.22)))
 
-        if index == (run_number + len(outlet_id)) % len(CANADA_PRODUCTS):
+        if index == (run_number + len(outlet_id)) % len(products):
             on_hand = int(product_forecast * rng.uniform(0.48, 0.70))
-        elif index == (run_number + len(outlet_id) + 3) % len(CANADA_PRODUCTS):
+        elif index == (run_number + len(outlet_id) + 3) % len(products):
             on_hand = int(product_forecast * rng.uniform(1.55, 1.85))
         else:
             on_hand = int(product_forecast * rng.uniform(0.94, 1.40))
@@ -443,7 +434,7 @@ def _build_legacy_dashboard_snapshot(
     }
 
 
-def _canada_source_candidates(brand_state: dict[str, Any], outlet_id: str) -> list[str]:
+def _source_candidates(brand_state: dict[str, Any], outlet_id: str) -> list[str]:
     outlets = get_demand_outlets(brand_state)
     target = outlets[outlet_id]
     same_region = [
@@ -464,17 +455,11 @@ def _build_item_planning_data(
 ) -> dict[str, Any]:
     """Build a planning snapshot using a planning-specific run counter."""
 
-    if brand_state['brand_id'] == INDIA_BRAND_ID:
-        return build_india_inventory_planning_data(
-            outlet_id=outlet_id,
-            horizon=horizon,
-            run_number=run_number,
-        )
-
+    products = _products(brand_state)
     profile = brand_state['profile']
     outlet = get_demand_outlet(brand_state, outlet_id)
     horizon = 7 if int(horizon) <= 7 else 14
-    rng = random.Random(_stable_seed(f'canada-plan:{outlet_id}:{horizon}:{run_number}'))
+    rng = random.Random(_stable_seed(f"{'canada' if brand_state['brand_id'] == CANADA_BRAND_ID else 'india'}-plan:{outlet_id}:{horizon}:{run_number}"))
 
     total_demand = sum(
         int(
@@ -486,17 +471,17 @@ def _build_item_planning_data(
         for day_index in range(1, horizon + 1)
     )
 
-    shortage_index = (run_number + len(outlet_id) + horizon) % len(CANADA_PRODUCTS)
-    watch_index = (shortage_index + 2) % len(CANADA_PRODUCTS)
-    overstock_index = (shortage_index + 4) % len(CANADA_PRODUCTS)
-    source_candidates = _canada_source_candidates(brand_state, outlet_id)
+    shortage_index = (run_number + len(outlet_id) + horizon) % len(products)
+    watch_index = (shortage_index + 2) % len(products)
+    overstock_index = (shortage_index + 4) % len(products)
+    source_candidates = _source_candidates(brand_state, outlet_id)
 
     inventory_rows: list[dict[str, Any]] = []
     risks: list[dict[str, Any]] = []
     projected_waste_value = 0.0
     at_risk_count = 0
 
-    for index, product in enumerate(CANADA_PRODUCTS):
+    for index, product in enumerate(products):
         forecast = max(20, int(total_demand * product['share'] * rng.uniform(0.96, 1.04)))
         average_daily = forecast / horizon
         safety_stock = max(6, int(average_daily * rng.uniform(1.4, 1.9)))
@@ -681,24 +666,28 @@ def _transfer_scope(details: list[dict[str, Any]]) -> str:
     return f"{total_units} units · {products} {'product' if products == 1 else 'products'}"
 
 
-def _canada_document_metadata(
+def _document_metadata(
     brand_state: dict[str, Any],
     outlet_id: str,
     plan_type: str,
 ) -> dict[str, str]:
     outlet = get_demand_outlet(brand_state, outlet_id)
-    manager = CANADA_PROCUREMENT_MANAGERS[
-        _stable_seed(f'{outlet_id}:{plan_type}') % len(CANADA_PROCUREMENT_MANAGERS)
+    is_india = brand_state['brand_id'] == INDIA_BRAND_ID
+    managers = INDIA_PROCUREMENT_MANAGERS if is_india else CANADA_PROCUREMENT_MANAGERS
+    manager = managers[
+        _stable_seed(f'{outlet_id}:{plan_type}') % len(managers)
     ]
     prefix = 'PO-CA' if plan_type == 'purchase' else 'STN-CA'
+    if is_india:
+        prefix = 'PO-IN' if plan_type == 'purchase' else 'STN-IN'
     suffix = _stable_seed(f'{outlet_id}:{plan_type}:{date.today()}') % 9000 + 1000
     return {
-        'company_name': 'Maple & Mason Café Canada',
-        'company_phone': '+1 416-555-0100',
-        'company_address': 'Demo operations office · Toronto, ON, Canada',
+        'company_name': brand_state['profile']['display_name'],
+        'company_phone': 'Demo contact' if is_india else '+1 416-555-0100',
+        'company_address': 'Demo operations office · New Delhi, India' if is_india else 'Demo operations office · Toronto, ON, Canada',
         'outlet_name': outlet.name,
-        'outlet_address': f'Demo outlet · {outlet.city}, {outlet.region}, Canada',
-        'outlet_phone': '+1 416-555-0190',
+        'outlet_address': f"Demo outlet · {outlet.city}, {outlet.region}, {brand_state['profile']['country']}",
+        'outlet_phone': 'Demo contact' if is_india else '+1 416-555-0190',
         'document_number': f'{prefix}-{date.today():%Y%m%d}-{suffix}',
         'document_date': date.today().strftime('%d %b %Y'),
         'manager_name': manager['name'],
@@ -714,11 +703,12 @@ def _build_legacy_plan_summary(
 ) -> list[dict[str, Any]]:
     """Build tenant-specific procurement and transfer documents."""
 
-    if brand_state['brand_id'] == INDIA_BRAND_ID:
-        return build_india_plan_summary(outlet_id=outlet_id, inventory_rows=inventory_rows)
-
+    products = _products(brand_state)
     profile = brand_state['profile']
     outlet = get_demand_outlet(brand_state, outlet_id)
+    is_india = brand_state['brand_id'] == INDIA_BRAND_ID
+    vendors = INDIA_VENDOR_DIRECTORY if is_india else CANADA_VENDOR_DIRECTORY
+    resources = INDIA_TRANSFER_RESOURCES if is_india else CANADA_TRANSFER_RESOURCES
     purchase_items: dict[tuple[str, str, str, float], dict[str, Any]] = {}
 
     for row in inventory_rows:
@@ -727,7 +717,7 @@ def _build_legacy_plan_summary(
         product_quantity = int(row.get('action_quantity', 0))
         if product_quantity <= 0:
             continue
-        for ingredient, per_unit, unit, vendor, unit_cost in CANADA_PRODUCT_RECIPES[row['product']]:
+        for ingredient, per_unit, unit, vendor, unit_cost in BOM_BY_BRAND[brand_state['brand_id']][row['product']]:
             key = (vendor, ingredient, unit, unit_cost)
             item = purchase_items.setdefault(key, {
                 'vendor': vendor,
@@ -744,8 +734,8 @@ def _build_legacy_plan_summary(
         {
             'id': index,
             'vendor': item['vendor'],
-            'vendor_phone': CANADA_VENDOR_DIRECTORY[item['vendor']]['phone'],
-            'vendor_address': CANADA_VENDOR_DIRECTORY[item['vendor']]['address'],
+            'vendor_phone': vendors[item['vendor']]['phone'],
+            'vendor_address': vendors[item['vendor']]['address'],
             'item': item['item'],
             'quantity': round(item['quantity'], 2),
             'unit': item['unit'],
@@ -764,9 +754,9 @@ def _build_legacy_plan_summary(
         if row.get('action_type') == 'Transfer' and int(row.get('action_quantity', 0)) > 0
     ]
     for index, row in enumerate(selected_transfers):
-        resource = CANADA_TRANSFER_RESOURCES[index % len(CANADA_TRANSFER_RESOURCES)]
+        resource = resources[index % len(resources)]
         quantity = int(row['action_quantity'])
-        cost_value = 35.0 + quantity * 0.45
+        cost_value = (650 + quantity * 3.5) if is_india else (35.0 + quantity * 0.45)
         eta_date = date.today() + timedelta(days=1 + index % 2)
         transfer_details.append({
             'id': index + 1,
@@ -784,8 +774,8 @@ def _build_legacy_plan_summary(
 
     purchase_cost = sum(item['cost_value'] for item in purchase_details)
     transfer_cost = sum(item['cost_value'] for item in transfer_details)
-    purchase_metadata = _canada_document_metadata(brand_state, outlet_id, 'purchase')
-    transfer_metadata = _canada_document_metadata(brand_state, outlet_id, 'transfer')
+    purchase_metadata = _document_metadata(brand_state, outlet_id, 'purchase')
+    transfer_metadata = _document_metadata(brand_state, outlet_id, 'transfer')
 
     return [
         {
@@ -871,7 +861,7 @@ def build_inventory_planning_data(
     planning.update(horizon=horizon, total_demand=total, risks=risks[:4], primary_risk=primary,
         at_risk_count=sum(r['status'] in ('Stockout risk', 'Watch') for r in planning['inventory_rows']),
         service_level=round(100 * max(0, total-shortage_units) / max(1, total), 1),
-        avoidable_waste=round(waste, 2),
+        avoidable_waste=round(waste, 2), sales_at_risk=round(loss, 2),
         recommendation={'headline': f'Protect the next {horizon}-day demand window at {planning["outlet"].name}',
             'body': primary['detail'], 'priority': primary['severity'],
             'impact': format_demand_money(loss, brand_state['profile']),

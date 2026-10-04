@@ -23,6 +23,9 @@ def refresh_network_forecast(
     """
 
     for outlet in outlets:
+        if 'demand_windows' in outlet:
+            # Canada is derived from daily item demand, never an independent draw.
+            continue
         rng = random.Random(
             _stable_seed(str(outlet['store_id'])) + int(run_number) * 307
         )
@@ -135,7 +138,7 @@ def build_table_columns(profile: dict[str, Any]) -> list[dict[str, Any]]:
         },
         {
             'name': 'revenue_unit',
-            'label': f'Revenue {unit_label}',
+            'label': f"{'Last 30d' if profile['country_code'] in ('CA', 'IN') else 'Revenue'} {unit_label}",
             'field': 'revenue_unit',
             'align': 'right',
             'sortable': True,
@@ -156,7 +159,7 @@ def build_table_columns(profile: dict[str, Any]) -> list[dict[str, Any]]:
         },
         {
             'name': 'forecast_unit',
-            'label': f'Next month {unit_label}',
+            'label': f"{'Next 30d' if profile['country_code'] in ('CA', 'IN') else 'Next month'} {unit_label}",
             'field': 'forecast_unit',
             'align': 'right',
             'sortable': True,
@@ -229,7 +232,9 @@ def build_priority_actions(
 
     inventory_outlet = max(
         rows,
-        key=lambda row: (float(row['stockout_pct']), float(row['monthly_revenue'])),
+        key=lambda row: (float(row['demand_windows']['7']['sales_at_risk'])
+                         if 'demand_windows' in row else float(row['stockout_pct']),
+                         float(row['monthly_revenue'])),
     )
     margin_outlet = min(
         rows,
@@ -243,6 +248,8 @@ def build_priority_actions(
         / 100
         * 0.45,
     )
+    if 'demand_windows' in inventory_outlet:
+        inventory_risk = inventory_outlet['demand_windows']['7']['sales_at_risk']
     target_margin = 15.0
     margin_gap = max(0.0, target_margin - float(margin_outlet['margin_pct']))
     margin_risk = max(
@@ -264,7 +271,7 @@ def build_priority_actions(
             'id': 'inventory_risk',
             'priority': 'HIGH',
             'title': f"{inventory_outlet['outlet']} inventory shortage",
-            'impact': f"{format_money(inventory_risk, profile)} sales at risk",
+            'impact': f"{format_money(inventory_risk, profile)} sales at risk" + (' · next 7 days' if 'demand_windows' in inventory_outlet else ''),
             'impact_amount': round(inventory_risk, 2),
             'action': 'Approve stock transfer',
             'button': 'Approve transfer',
@@ -310,6 +317,8 @@ def build_command_center_snapshot(
     summary = summarize_network(rows)
     actions = build_priority_actions(rows, profile)
     revenue_at_risk = sum(float(action.get('impact_amount', 0.0)) for action in actions)
+    if profile['country_code'] in ('CA', 'IN') and all('demand_windows' in row for row in rows):
+        revenue_at_risk = sum(row['demand_windows']['7']['sales_at_risk'] for row in rows)
 
     return {
         'summary': summary,

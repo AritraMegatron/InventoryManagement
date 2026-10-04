@@ -302,13 +302,13 @@ def command_center_page() -> None:
 
     executive_kpis = [
         {
-            'title': 'Monthly revenue',
+            'title': 'Revenue · last 30 days' if profile['country_code'] in ('CA', 'IN') else 'Monthly revenue',
             'value': format_money(summary['monthly_revenue'], profile),
-            'subtitle': 'Current network run rate',
+            'subtitle': 'Shared daily item sales' if profile['country_code'] in ('CA', 'IN') else 'Current network run rate',
             'icon': 'payments',
         },
         {
-            'title': 'Next-month forecast',
+            'title': 'Next 30-day forecast' if profile['country_code'] in ('CA', 'IN') else 'Next-month forecast',
             'value': format_money(summary['next_month_revenue'], profile),
             'subtitle': f"{summary['forecast_growth_pct']:+.1f}% projected growth",
             'icon': 'trending_up',
@@ -328,7 +328,7 @@ def command_center_page() -> None:
         {
             'title': 'Revenue at risk',
             'value': format_money(command_snapshot['revenue_at_risk'], profile),
-            'subtitle': 'Top active operational risks',
+            'subtitle': 'Inventory exposure · next 7 days' if profile['country_code'] in ('CA', 'IN') else 'Top active operational risks',
             'icon': 'warning',
         },
     ]
@@ -536,7 +536,8 @@ def command_center_page() -> None:
                 ui.label(
                     f"{profile['short_name']} is projected to "
                     f"{('grow' if summary['forecast_growth_pct'] >= 0 else 'decline')} "
-                    f"{abs(summary['forecast_growth_pct']):.1f}% next month. "
+                    f"{abs(summary['forecast_growth_pct']):.1f}% "
+                    f"{'over the next 30 days' if profile['country_code'] in ('CA', 'IN') else 'next month'}. "
                     f"{summary['underperforming_count']} of "
                     f"{summary['outlet_count']} outlets are underperforming. "
                     f"The highest current operational alert is {lead_risk.lower()}, "

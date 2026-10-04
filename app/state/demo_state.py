@@ -30,7 +30,7 @@ def build_brand_state(brand_id: str) -> dict[str, Any]:
     profile = get_brand_profile(brand_id)
     outlets = build_network_rows(brand_id)
 
-    return {
+    state = {
         'schema_version': STATE_SCHEMA_VERSION,
         'brand_id': brand_id,
         'profile': profile,
@@ -60,6 +60,15 @@ def build_brand_state(brand_id: str) -> dict[str, Any]:
             'product_pilots': [],
         },
     }
+    _sync_network(state)
+    return state
+
+
+def _sync_network(state: dict[str, Any]) -> None:
+    # Local import keeps state construction independent of page/UI imports.
+    if state['brand_id'] in ('maple_mason_canada', 'northstar_india'):
+        from app.services.brand_network_sync_service import sync_brand_network
+        sync_brand_network(state)
 
 
 def build_demo_session(selected_brand_id: str = DEFAULT_BRAND_ID) -> dict[str, Any]:
@@ -115,6 +124,7 @@ def select_brand(
     if brand_id not in session['brands']:
         session['brands'][brand_id] = build_brand_state(brand_id)
 
+    _sync_network(session['brands'][brand_id])
     return session['brands'][brand_id]
 
 
@@ -130,6 +140,7 @@ def get_brand_state(
     if resolved_brand_id not in session['brands']:
         session['brands'][resolved_brand_id] = build_brand_state(resolved_brand_id)
 
+    _sync_network(session['brands'][resolved_brand_id])
     return session['brands'][resolved_brand_id]
 
 

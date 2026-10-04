@@ -11,6 +11,7 @@ from app.ai_chat import AIChatController, create_ai_chat
 from app.company_context import PAGE_CONTEXTS
 from app.session_ui import require_brand_login, render_brand_session_controls
 from app.services.currency_service import format_money
+from app.services.brand_network_sync_service import sync_brand_network
 from app.services.network_service import (
     build_network_view_rows,
     build_region_centers,
@@ -70,6 +71,16 @@ def _ai_observation(
     store: dict[str, Any],
     profile: dict[str, Any],
 ) -> tuple[str, str]:
+    if profile['country_code'] in ('CA', 'IN'):
+        metrics = store['demand_windows']['7']
+        return (
+            f"Last 30 days: {format_money(store['monthly_revenue'], profile)} revenue. "
+            f"Next 30 days: {format_money(store['next_month_revenue'], profile)} forecast "
+            f"({store['growth_pct']:+.1f}%). The next 7 days have "
+            f"{metrics['at_risk_count']} items at risk and "
+            f"{metrics['service_level']:.1f}% projected service level.",
+            'Review the matching 7- or 14-day window in Demand & Inventory before approving replenishment.',
+        )
     revenue_per_employee = (
         float(store['monthly_revenue']) / max(1, int(store['employees']))
     )
@@ -410,6 +421,7 @@ def network_intelligence_page() -> None:
         return
 
     brand_state = get_brand_state(app.storage.user, profile['brand_id'])
+    is_synced = profile['country_code'] in ('CA', 'IN')
     outlets = brand_state['network']['outlets']
     network_workflow = brand_state['workflows']['network_intelligence']
 
@@ -455,6 +467,7 @@ def network_intelligence_page() -> None:
         'status': 'All statuses',
         'search': '',
         'analysis_run': network_workflow['analysis_run_number'],
+        'demand_horizon': 7,
     }
 
     refs: dict[str, Any] = {}
@@ -541,6 +554,22 @@ def network_intelligence_page() -> None:
             f'{employees:,}'
         )
 
+    def demand_metric_values(store):
+        metrics = store['demand_windows'][str(state['demand_horizon'])]
+        return {
+            'demand_units': f"{metrics['predicted_units']:,}",
+            'demand_revenue': format_money(metrics['expected_revenue'], profile, compact=False),
+            'demand_service': f"{metrics['service_level']:.1f}%",
+            'demand_risk': str(metrics['at_risk_count']),
+            'demand_waste': format_money(metrics['avoidable_waste'], profile, compact=False),
+            'demand_sales_risk': format_money(metrics['sales_at_risk'], profile, compact=False),
+            'demand_dates': f"{metrics['start']} → {metrics['end']}",
+        }
+
+    def change_demand_horizon(event):
+        state['demand_horizon'] = int(event.value)
+        update_detail(stores_by_id[state['selected_id']])
+
     def update_detail(
         store: dict[str, Any],
     ) -> None:
@@ -599,6 +628,9 @@ def network_intelligence_page() -> None:
             'selected_observation': observation,
             'selected_action': action,
         }
+
+        if is_synced:
+            values.update(demand_metric_values(store))
 
         for reference_name, text in values.items():
             refs[reference_name].set_text(text)
@@ -815,7 +847,10 @@ def network_intelligence_page() -> None:
 
         state['analysis_run'] += 1
         network_workflow['analysis_run_number'] = state['analysis_run']
-        refresh_network_forecast(outlets, state['analysis_run'])
+        if is_synced:
+            sync_brand_network(brand_state)
+        else:
+            refresh_network_forecast(outlets, state['analysis_run'])
 
         refreshed_rows = {
             row['store_id']: row
@@ -823,9 +858,7 @@ def network_intelligence_page() -> None:
         }
         for store in stores:
             refreshed = refreshed_rows[store['store_id']]
-            store['growth_pct'] = refreshed['growth_pct']
-            store['next_month_revenue'] = refreshed['next_month_revenue']
-            store['forecast_unit'] = refreshed['forecast_unit']
+            store.update(refreshed)
 
 
         update_kpis(
@@ -837,9 +870,8 @@ def network_intelligence_page() -> None:
         )
 
         refs['last_sync'].set_text(
-            f"Updated {datetime.now():%H:%M} · "
-            f"Forecast scenario "
-            f"{state['analysis_run'] + 1}"
+            (f"Synced {datetime.now():%H:%M} · Shared item forecast" if is_synced else
+             f"Updated {datetime.now():%H:%M} · Forecast scenario {state['analysis_run'] + 1}")
         )
 
         progress.dismiss()
@@ -876,8 +908,9 @@ def network_intelligence_page() -> None:
                 )
 
                 ui.label(
-                    'Compare revenue, profitability, staffing, '
-                    'and next-month outlook across the network.'
+                    ('Compare last-30-day performance and next-30-day item forecasts across the network.'
+                     if is_synced else
+                     'Compare revenue, profitability, staffing, and next-month outlook across the network.')
                 ).classes(
                     'text-sm muted'
                 )
@@ -979,7 +1012,7 @@ def network_intelligence_page() -> None:
                 refs['network_revenue'],
                 refs['network_revenue_sub'],
             ) = _metric_card(
-                'Network revenue',
+                'Revenue · last 30 days' if is_synced else 'Network revenue',
                 format_money(total_revenue, profile),
                 f'{len(stores)} visible outlets',
                 'payments',
@@ -991,7 +1024,7 @@ def network_intelligence_page() -> None:
             ) = _metric_card(
                 'Operating profit',
                 format_money(total_profit, profile),
-                'Store operating profit',
+                'Last 30 days · modeled margin' if is_synced else 'Store operating profit',
                 'account_balance_wallet',
             )
 
@@ -999,9 +1032,9 @@ def network_intelligence_page() -> None:
                 refs['network_forecast'],
                 refs['network_forecast_sub'],
             ) = _metric_card(
-                'Next-month forecast',
+                'Next 30-day forecast' if is_synced else 'Next-month forecast',
                 format_money(total_forecast, profile),
-                'Projected next month',
+                'Shared with Demand & Inventory' if is_synced else 'Projected next month',
                 'trending_up',
             )
 
@@ -1185,7 +1218,7 @@ def network_intelligence_page() -> None:
                 ):
                     summary_metrics = [
                         (
-                            'CURRENT REVENUE',
+                            'LAST 30 DAYS' if is_synced else 'CURRENT REVENUE',
                             'selected_revenue',
                             format_money(selected['monthly_revenue'], profile),
                         ),
@@ -1195,7 +1228,7 @@ def network_intelligence_page() -> None:
                             format_money(selected['operating_profit'], profile),
                         ),
                         (
-                            'NEXT MONTH',
+                            'NEXT 30 DAYS' if is_synced else 'NEXT MONTH',
                             'selected_forecast',
                             format_money(selected['next_month_revenue'], profile),
                         ),
@@ -1243,7 +1276,7 @@ def network_intelligence_page() -> None:
                         f"{selected['margin_pct']:.1f}%",
                     ),
                     (
-                        'Monthly orders',
+                        'Orders · last 30 days' if is_synced else 'Monthly orders',
                         'selected_orders',
                         f"{selected['monthly_orders']:,}",
                     ),
@@ -1281,12 +1314,12 @@ def network_intelligence_page() -> None:
                         f"{selected['rating']:.1f} / 5",
                     ),
                     (
-                        'Waste rate',
+                        '7d waste / forecast revenue' if is_synced else 'Waste rate',
                         'selected_waste',
                         f"{selected['waste_pct']:.1f}%",
                     ),
                     (
-                        'Stockout rate',
+                        '7d unmet demand' if is_synced else 'Stockout rate',
                         'selected_stockout',
                         (
                             f"{selected['stockout_pct']:.1f}%"
@@ -1319,6 +1352,29 @@ def network_intelligence_page() -> None:
                             ).classes(
                                 'text-sm font-semibold'
                             )
+
+                if is_synced:
+                    ui.separator().classes('opacity-20 my-4')
+                    ui.label('DEMAND & INVENTORY').classes('text-xs font-bold text-white/80')
+                    ui.select(
+                        {7: 'Next 7 days', 14: 'Next 14 days'},
+                        value=state['demand_horizon'], on_change=change_demand_horizon,
+                    ).props('dark outlined dense').classes('w-full')
+                    demand_values = demand_metric_values(selected)
+                    refs['demand_dates'] = ui.label(demand_values['demand_dates']).classes('text-xs text-white/60')
+                    with ui.grid(columns=2).classes('w-full gap-3'):
+                        for label, key in (
+                            ('Predicted item demand', 'demand_units'),
+                            ('Expected revenue', 'demand_revenue'),
+                            ('Projected service level', 'demand_service'),
+                            ('Items at risk', 'demand_risk'),
+                            ('Avoidable waste', 'demand_waste'),
+                            ('Sales at risk', 'demand_sales_risk'),
+                        ):
+                            with ui.column().classes('gap-0'):
+                                ui.label(label).classes('text-[10px] text-white/55')
+                                refs[key] = ui.label(demand_values[key]).classes('text-sm font-semibold')
+                    ui.label('Before replenishment · matches the same outlet and window in Demand & Inventory.').classes('text-xs text-white/55')
 
                 observation, action = _ai_observation(
                     selected,
