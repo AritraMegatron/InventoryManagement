@@ -10,12 +10,14 @@ from typing import Any
 from app.data.brand_catalog import CANADA_BRAND_ID, INDIA_BRAND_ID
 from app.mock_data import (
     OUTLETS as INDIA_OUTLETS,
+    PRODUCTS as INDIA_PRODUCTS,
     REGIONS as INDIA_REGIONS,
     build_dashboard_snapshot as build_india_dashboard_snapshot,
     build_inventory_planning_data as build_india_inventory_planning_data,
     build_plan_summary as build_india_plan_summary,
     format_inr,
 )
+from app.services.demand_dataset_service import get_demand_dataset, period_item_totals, daily_totals
 from app.services.currency_service import format_money
 from app.data.ingredient_bom import BOM_BY_BRAND
 from app.services.ingredient_planning_service import (
@@ -254,7 +256,7 @@ def _select_canada_signals(
     return result
 
 
-def build_dashboard_snapshot(
+def _build_legacy_dashboard_snapshot(
     brand_state: dict[str, Any],
     outlet_id: str,
     horizon: int = 7,
@@ -823,16 +825,97 @@ def _build_legacy_plan_summary(
     ]
 
 
+def _dataset(brand_state, outlet_id):
+    products = INDIA_PRODUCTS if brand_state['brand_id'] == INDIA_BRAND_ID else CANADA_PRODUCTS
+    return get_demand_dataset(brand_state, get_demand_outlet(brand_state, outlet_id), products)
+
+
 def build_inventory_planning_data(
     brand_state: dict[str, Any], outlet_id: str, horizon: int, run_number: int = 0,
 ) -> dict[str, Any]:
-    planning = _build_item_planning_data(brand_state, outlet_id, horizon, run_number)
+    horizon = 7 if int(horizon) <= 7 else 14
+    dataset = _dataset(brand_state, outlet_id)
+    # Opening stock, safety stock and transfer capacity are fixed across windows/runs.
+    planning = _build_item_planning_data(brand_state, outlet_id, 7, 0)
+    totals = period_item_totals(dataset, horizon)
+    prices = {r['product']: r['price'] for r in dataset['items']}
+    risks = []
+    loss = waste = 0.0
+    shortage_units = 0
+    for row in planning['inventory_rows']:
+        row['forecast'] = totals[row['product']]
+        row['usable_stock'] = max(0, row['on_hand'] - row['safety_stock'])
+        demand = row['forecast']
+        gap = max(0, demand - row['usable_stock'])
+        excess = max(0, row['usable_stock'] - demand)
+        daily = demand / horizon
+        row['coverage'] = f"{row['on_hand'] / max(daily, 1):.1f} days"
+        row['recommended_qty'] = gap
+        row['recommended_mode'] = ('Transfer' if gap and max(row['transfer_options'].values(), default=0) >= gap else 'Order')
+        row['action'] = f"{row['recommended_mode']} {gap} units" if gap else 'No action'
+        row['status'] = 'Stockout risk' if gap > daily * .75 else 'Watch' if gap else 'Overstock' if excess > demand * .22 else 'Healthy'
+        severity = 'High' if row['status'] == 'Stockout risk' else 'Medium' if row['status'] in ('Watch', 'Overstock') else 'Low'
+        impact = gap * prices[row['product']] if gap else excess * prices[row['product']] * .20 if row['status'] == 'Overstock' else 0
+        shortage_units += gap
+        loss += gap * prices[row['product']]
+        if row['status'] == 'Overstock':
+            waste += impact
+        if row['status'] != 'Healthy':
+            risks.append({'product': row['product'], 'severity': severity,
+                'detail': (f'{gap} units below the {horizon}-day demand target after item safety stock.' if gap else f'{excess} units above the {horizon}-day demand target.'),
+                'impact': format_demand_money(impact, brand_state['profile']), 'recommended_qty': gap})
+    risks.sort(key=lambda r: {'High': 0, 'Medium': 1, 'Low': 2}[r['severity']])
+    primary = risks[0] if risks else {'product': 'No critical risk', 'severity': 'Low',
+        'detail': f'All products cover the next {horizon} days.', 'impact': format_demand_money(0, brand_state['profile']), 'recommended_qty': 0}
+    total = sum(totals.values())
+    planning.update(horizon=horizon, total_demand=total, risks=risks[:4], primary_risk=primary,
+        at_risk_count=sum(r['status'] in ('Stockout risk', 'Watch') for r in planning['inventory_rows']),
+        service_level=round(100 * max(0, total-shortage_units) / max(1, total), 1),
+        avoidable_waste=round(waste, 2),
+        recommendation={'headline': f'Protect the next {horizon}-day demand window at {planning["outlet"].name}',
+            'body': primary['detail'], 'priority': primary['severity'],
+            'impact': format_demand_money(loss, brand_state['profile']),
+            'waste': format_demand_money(waste, brand_state['profile'])})
     baseline = _build_item_planning_data(brand_state, outlet_id, 7, 0)
+    baseline_totals = period_item_totals(dataset, 7)
+    for row in baseline['inventory_rows']:
+        row['forecast'] = baseline_totals[row['product']]
     ensure_ingredient_stock(brand_state, outlet_id, baseline['inventory_rows'])
-    planning['ingredient_rows'] = build_ingredient_rows(
-        brand_state, outlet_id, planning['inventory_rows'],
-    )
+    planning['ingredient_rows'] = build_ingredient_rows(brand_state, outlet_id, planning['inventory_rows'])
     return planning
+
+
+def build_dashboard_snapshot(
+    brand_state: dict[str, Any], outlet_id: str, horizon: int = 7,
+    run_number: int = 0, excluded_signal_labels: set[str] | None = None,
+) -> dict[str, Any]:
+    horizon = int(horizon)
+    dataset = _dataset(brand_state, outlet_id)
+    # Legacy narrative metadata only; its generated series and KPIs are replaced.
+    result = _build_legacy_dashboard_snapshot(brand_state, outlet_id, 7, 0)
+    anchor = date.fromisoformat(dataset['as_of'])
+    history = daily_totals(dataset, range(-6, 1))
+    future = daily_totals(dataset, range(1, horizon + 1))
+    totals = period_item_totals(dataset, horizon)
+    result['signals'] = deepcopy(dataset['signals'])
+    # Also clean labels already cached by the previous catalog version.
+    for signal in result['signals']:
+        signal['detail'] = signal.get('detail', '').removesuffix(' · Simulated')
+    result.update(horizon=horizon,
+        categories=[(anchor + timedelta(days=i)).strftime('%d %b') for i in range(-6, horizon+1)],
+        actual=history + [None]*horizon,
+        forecast=[None]*6 + [history[-1]] + future,
+        lower=[None]*6 + [history[-1]] + [int(v*(1-(.07+i*.004))) for i,v in enumerate(future,1)],
+        upper=[None]*6 + [history[-1]] + [int(v*(1+(.07+i*.004))) for i,v in enumerate(future,1)])
+    result['kpis']['predicted_units'] = sum(future)
+    result['kpis']['expected_revenue'] = round(sum(totals[r['product']] * r['price'] for r in dataset['items']), 2)
+    result['kpis']['confidence'] = round(92.2 - max(0,horizon-7)*.20, 1)
+    planning = build_inventory_planning_data(brand_state, outlet_id, min(horizon, 14))
+    for key in ('service_level', 'at_risk_count', 'avoidable_waste'):
+        result['kpis'][key] = planning[key]
+    for key in ('inventory_rows', 'risks', 'primary_risk', 'recommendation'):
+        result[key] = deepcopy(planning[key])
+    return result
 
 
 def build_plan_summary(
@@ -847,8 +930,7 @@ def build_plan_summary(
         if row.get('action_type') == 'Order':
             row['action_type'] = ''
     plans = _build_legacy_plan_summary(brand_state, outlet_id, transfer_rows)
-    baseline = _build_item_planning_data(brand_state, outlet_id, 7, 0)
-    ensure_ingredient_stock(brand_state, outlet_id, baseline['inventory_rows'])
+    build_inventory_planning_data(brand_state, outlet_id, 7)
     ingredients = build_ingredient_rows(brand_state, outlet_id, inventory_rows)
     details = build_ingredient_purchase_lines(brand_state, ingredients)
     profile = brand_state['profile']

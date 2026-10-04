@@ -5,7 +5,7 @@ from typing import Any
 
 
 COMMAND_DECISION_VERSION = 1
-DEMAND_WORKSPACE_VERSION = 2
+DEMAND_WORKSPACE_VERSION = 4
 
 
 def ensure_command_center_decisions(
@@ -87,6 +87,7 @@ def ensure_demand_inventory_workspace(
         workflow.update(
             {
                 'workspace_version': DEMAND_WORKSPACE_VERSION,
+                'forecast_loaded': False,
                 'forecast_run_number': preserved_forecast_run,
                 'planning_run_number': preserved_planning_run,
                 'region': default_region,

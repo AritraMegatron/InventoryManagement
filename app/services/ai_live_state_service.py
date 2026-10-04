@@ -226,6 +226,14 @@ def get_inventory_risks(brand_state: dict[str, Any]) -> dict[str, Any]:
         default_outlet_id=default_outlet_id,
     )
 
+    if not workflow.get('forecast_loaded', False):
+        return {
+            'selected_region': workflow.get('region', default_region),
+            'selected_outlet_id': workflow.get('outlet_id', default_outlet_id),
+            'forecast_loaded': False,
+            'status': 'Awaiting Run AI forecast; no demand, inventory KPIs, signals or plan loaded for this selection.',
+        }
+
     outlet_id = str(workflow.get('outlet_id') or default_outlet_id)
     try:
         outlet = get_demand_outlet(brand_state, outlet_id)

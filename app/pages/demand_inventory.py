@@ -11,8 +11,6 @@ from app.company_context import PAGE_CONTEXTS
 from app.session_ui import require_brand_login, render_brand_session_controls
 
 from app.services.demand_inventory_service import (
-    advance_forecast_run,
-    advance_planning_run,
     build_dashboard_snapshot,
     build_inventory_planning_data,
     build_plan_summary,
@@ -754,6 +752,8 @@ def demand_inventory_page() -> None:
         'inventory_built': bool(workflow_state.get('inventory_built', False)),
         'plan_generated': bool(workflow_state.get('plan_generated', False)),
         'plan_approved': bool(workflow_state.get('plan_approved', False)),
+        'loaded': bool(workflow_state.get('forecast_loaded', False)),
+        'selection_version': 0,
         'ingredient_view': False,
         'selected_inventory_row_id': None,
     }
@@ -786,7 +786,7 @@ def demand_inventory_page() -> None:
         horizon: int,
         run_number: int,
     ) -> dict[str, Any]:
-        """Create a snapshot with three signals different from the current set."""
+        """Read the stable forecast snapshot for this outlet and horizon."""
 
         new_snapshot = build_dashboard_snapshot(
             brand_state=brand_state,
@@ -947,7 +947,40 @@ def demand_inventory_page() -> None:
         refs['generate_plan_button'].disable()
         refs['approve_button'].disable()
 
+    def clear_chart(chart_key: str) -> None:
+        options = deepcopy(refs[chart_key].options)
+        for series in options.get('series', []):
+            series['data'] = []
+        for axis in ('xAxis', 'yAxis'):
+            if isinstance(options.get(axis), dict) and options[axis].get('type') == 'category':
+                options[axis]['data'] = []
+        _replace_echart_options(refs[chart_key], options)
+
+    def blank_dashboard() -> None:
+        state['loaded'] = False
+        workflow_state['forecast_loaded'] = False
+        state['selection_version'] += 1
+        clear_action_workflow()
+        for key in ('predicted_units', 'expected_revenue', 'service_level', 'risk_count',
+                    'avoidable_waste', 'rec_impact', 'rec_waste', 'rec_priority'):
+            refs[key].set_text('—')
+        refs['rec_headline'].set_text('Run AI forecast to load this outlet')
+        refs['rec_body'].set_text('')
+        refs['last_run'].set_text('Waiting for forecast')
+        refs['planning_subtitle'].set_text('Run AI forecast to load availability')
+        clear_chart('forecast_chart')
+        clear_chart('risk_chart')
+        render_demand_signals([])
+        render_inventory_risks([])
+        refs['build_action_button'].disable()
+        refs['emergency_transfer_button'].disable()
+        for key in ('action_dialog', 'approve_dialog', 'transfer_dialog', 'plan_detail_dialog'):
+            refs[key].close()
+
     def refresh_availability_chart() -> None:
+        if not state['loaded']:
+            clear_chart('risk_chart')
+            return
         ingredient_view = state['ingredient_view']
         ingredients = build_ingredient_equivalent_rows(
             brand_state, planning_data['inventory_rows'],
@@ -1034,38 +1067,26 @@ def demand_inventory_page() -> None:
         refresh_availability_chart()
 
     async def run_forecast() -> None:
+        token = state['selection_version']
+        outlet_id = state['outlet_id']
         refs['run_button'].disable()
-
-        progress = ui.notification(
-            'Refreshing demand signals and outlet forecast…',
-            spinner=True,
-            type='ongoing',
-            timeout=None,
-            position='top',
-        )
-
-        await asyncio.sleep(0.85)
-
-        state['forecast_run_number'] = advance_forecast_run(brand_state)
-
-        new_snapshot = create_snapshot(
-            outlet_id=state['outlet_id'],
-            horizon=state['horizon'],
-            run_number=state['forecast_run_number'],
-        )
-
-        apply_snapshot(new_snapshot)
-
-        progress.dismiss()
-        refs['run_button'].enable()
-
-        ui.notify(
-            f"Forecast refreshed for "
-            f"{new_snapshot['outlet'].name}",
-            type='positive',
-            icon='check_circle',
-            position='top',
-        )
+        progress = ui.notification('Loading outlet forecast…', spinner=True,
+            type='ongoing', timeout=None, position='top')
+        try:
+            await asyncio.sleep(0.85)
+            if token != state['selection_version'] or outlet_id != state['outlet_id']:
+                return
+            new_snapshot = create_snapshot(outlet_id, state['horizon'], 0)
+            state['loaded'] = True
+            workflow_state['forecast_loaded'] = True
+            apply_snapshot(new_snapshot)
+            update_planning_view()
+            refs['build_action_button'].enable()
+            refs['emergency_transfer_button'].enable()
+            ui.notify(f"Forecast loaded for {new_snapshot['outlet'].name}", type='positive')
+        finally:
+            progress.dismiss()
+            refs['run_button'].enable()
 
     def apply_snapshot(
         new_snapshot: dict[str, Any],
@@ -1183,63 +1204,29 @@ def demand_inventory_page() -> None:
         state['outlet_id'] = outlet_id
         workflow_state['outlet_id'] = outlet_id
 
-        state['forecast_run_number'] = advance_forecast_run(brand_state)
-        new_snapshot = create_snapshot(
-            outlet_id=outlet_id,
-            horizon=state['horizon'],
-            run_number=state['forecast_run_number'],
-        )
-        apply_snapshot(new_snapshot)
+        outlet = get_demand_outlet(brand_state, outlet_id)
+        refs['context'].set_text(f'{outlet.city} · {outlet.outlet_format} · {outlet.delivery_share}% delivery mix')
+        blank_dashboard()
 
-        state['planning_run_number'] = advance_planning_run(brand_state)
-        update_planning_view()
-
-        ui.notify(
-            f"Loaded {get_demand_outlet(brand_state, outlet_id).name}",
-            type='info',
-            position='top',
-        )
-
-    def on_horizon_change(
-        event: Any,
-    ) -> None:
-        state['horizon'] = int(
-            event.value
-        )
+    def on_horizon_change(event: Any) -> None:
+        state['horizon'] = int(event.value)
         workflow_state['forecast_horizon'] = state['horizon']
+        if state['loaded']:
+            apply_snapshot(create_snapshot(state['outlet_id'], state['horizon'], 0))
 
-        state['forecast_run_number'] = advance_forecast_run(brand_state)
-
-        new_snapshot = create_snapshot(
-            outlet_id=state['outlet_id'],
-            horizon=state['horizon'],
-            run_number=state['forecast_run_number'],
-        )
-
-        apply_snapshot(
-            new_snapshot
-        )
-
-    def on_planning_horizon_change(
-        event: Any,
-    ) -> None:
-        state['planning_horizon'] = int(
-            event.value
-        )
+    def on_planning_horizon_change(event: Any) -> None:
+        state['planning_horizon'] = int(event.value)
         workflow_state['planning_horizon'] = state['planning_horizon']
-        state['planning_run_number'] = advance_planning_run(brand_state)
-
-        update_planning_view()
-
-        ui.notify(
-            f"Inventory planning changed to the next "
-            f"{state['planning_horizon']} days. "
-            f"Build the action plan again.",
-            type='info',
-            position='top',
-        )
+        if state['loaded']:
+            # Invalidates an in-flight build/generation for the previous horizon.
+            state['selection_version'] += 1
+            update_planning_view()
+            refs['build_action_button'].enable()
 
     async def build_action_plan() -> None:
+        if not state['loaded']:
+            return
+        token = state['selection_version']
         refs['build_action_button'].disable()
 
         progress = ui.notification(
@@ -1251,6 +1238,9 @@ def demand_inventory_page() -> None:
         )
 
         await asyncio.sleep(0.45)
+        if token != state['selection_version'] or not state['loaded']:
+            progress.dismiss()
+            return
 
         rows = deepcopy(
             planning_data['inventory_rows']
@@ -1550,6 +1540,9 @@ def demand_inventory_page() -> None:
         )
 
     async def generate_replenishment_plan() -> None:
+        if not state['loaded']:
+            return
+        token = state['selection_version']
         if not state['inventory_built']:
             ui.notify(
                 'Build the action plan first.',
@@ -1568,6 +1561,9 @@ def demand_inventory_page() -> None:
         )
 
         await asyncio.sleep(0.55)
+        if token != state['selection_version'] or not state['loaded']:
+            progress.dismiss()
+            return
 
         plan_rows = build_plan_summary(
             brand_state=brand_state,
@@ -2056,6 +2052,8 @@ def demand_inventory_page() -> None:
         )
 
     def open_transfer_dialog() -> None:
+        if not state['loaded']:
+            return
         high_risk = next(
             (
                 risk
@@ -2479,7 +2477,7 @@ def demand_inventory_page() -> None:
 
             ui.space()
 
-            ui.button(
+            refs['emergency_transfer_button'] = ui.button(
                 'Emergency transfer',
                 icon='local_shipping',
                 on_click=open_transfer_dialog,
@@ -3032,3 +3030,8 @@ def demand_inventory_page() -> None:
             ).classes(
                 'text-[11px] font-bold text-primary'
             )
+
+    # Clear before the initial page response is sent; switching back to a loaded
+    # workspace can retain its last completed snapshot.
+    if not state['loaded']:
+        blank_dashboard()
