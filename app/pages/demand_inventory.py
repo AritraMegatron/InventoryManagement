@@ -685,6 +685,58 @@ def demand_inventory_page() -> None:
     workflow_state['outlet_id'] = persisted_outlet_id
 
     apply_theme()
+    ui.add_css("""
+        .vesper-view-switch .q-toggle__inner {
+            width: 54px;
+            height: 32px;
+            min-width: 54px;
+            padding: 0;
+        }
+        .vesper-view-switch .q-toggle__track {
+            position: absolute;
+            top: 3px;
+            left: 0;
+            width: 54px;
+            height: 26px;
+            border-radius: 6px;
+            background: #eee5e8;
+            border: 1px solid #cdb9c1;
+            opacity: 1;
+            box-shadow: inset 0 1px 3px rgba(59, 13, 34, .12);
+            transition: background .2s ease, border-color .2s ease;
+        }
+        .vesper-view-switch .q-toggle__thumb {
+            top: 7px;
+            left: 4px;
+            width: 18px;
+            height: 18px;
+            transition: left .2s ease;
+        }
+        .vesper-view-switch .q-toggle__thumb:after {
+            border-radius: 4px;
+            background: linear-gradient(145deg, #f5dba3, #c69b43);
+            box-shadow: 0 1px 4px rgba(59, 13, 34, .28);
+        }
+        .vesper-view-switch .q-toggle__thumb:before {
+            display: none;
+        }
+        .vesper-view-switch .q-toggle__inner--truthy .q-toggle__track {
+            background: #5a1534;
+            border-color: #5a1534;
+        }
+        .vesper-view-switch .q-toggle__inner--truthy .q-toggle__thumb {
+            left: 32px;
+        }
+        .vesper-view-switch:focus-visible {
+            outline: 2px solid #c69b43;
+            outline-offset: 4px;
+            border-radius: 6px;
+        }
+        @media (prefers-reduced-motion: reduce) {
+            .vesper-view-switch .q-toggle__thumb,
+            .vesper-view-switch .q-toggle__track { transition: none; }
+        }
+    """)
     ai_chat = create_ai_chat(
         page_name='Demand & Inventory',
         page_context=PAGE_CONTEXTS['demand_inventory'],
@@ -2745,12 +2797,11 @@ def demand_inventory_page() -> None:
                             'w-40'
                         )
 
-                        with ui.row().classes('items-center gap-0'):
-                            ui.label('Items').classes('text-xs muted')
-                            ui.switch(value=False, on_change=toggle_availability).props(
-                                'dense color=primary size=sm aria-label="Show ingredients"'
-                            ).tooltip('Switch between item and ingredient availability')
-                            ui.label('Ingredients').classes('text-xs muted')
+                        ui.switch(value=False, on_change=toggle_availability).props(
+                            'dense color=primary size=sm aria-label="Show ingredient view"'
+                        ).classes('vesper-view-switch').tooltip(
+                            'Switch between item and ingredient availability'
+                        )
 
                 with ui.element('div').classes('w-full mt-2').style(
                     'height: 360px; min-height: 360px; max-height: 360px; overflow-y: auto; overflow-x: hidden'
